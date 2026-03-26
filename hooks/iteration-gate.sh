@@ -37,8 +37,20 @@ fi
 # against results.tsv row count. A gap means an iteration was committed
 # but never recorded in results.tsv.
 #
-# Use git log on HEAD (we're on the autoresearch-x branch during a run)
-iter_commits=$(git log --oneline HEAD 2>/dev/null | grep -cE "^[a-f0-9]+ iter [0-9]" || echo 0)
+# Only count commits since the run branch diverged from its parent.
+# The branch is autoresearch-x/<tag>, find the merge-base to scope the count.
+run_branch="autoresearch-x/$RUN_TAG"
+merge_base=$(git merge-base "$run_branch" "$run_branch@{upstream}" 2>/dev/null \
+    || git merge-base "$run_branch" main 2>/dev/null \
+    || git merge-base "$run_branch" master 2>/dev/null \
+    || echo "")
+
+if [[ -n "$merge_base" ]]; then
+    iter_commits=$(git log --oneline "$merge_base"..HEAD 2>/dev/null | grep -cE "^[a-f0-9]+ iter [0-9]" || echo 0)
+else
+    # Fallback: no merge-base found, count all (original behavior)
+    iter_commits=$(git log --oneline HEAD 2>/dev/null | grep -cE "^[a-f0-9]+ iter [0-9]" || echo 0)
+fi
 
 if [[ "$iter_commits" -gt "$tsv_rows" ]]; then
     gap=$((iter_commits - tsv_rows))
