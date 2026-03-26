@@ -40,26 +40,37 @@ Guardrail Hooks
 └── completion-check     — blocks stopping without a final report
 ```
 
-## Quick Start
+## Installation
 
-### Installation
-
-#### As a Claude Code Plugin
+### Claude Code (Recommended)
 
 ```bash
-# Clone the repo
-git clone https://github.com/waynejing995/autoresearch-x.git
+# Add as a marketplace, then install
+claude plugin marketplace add --source github --repo waynejing995/autoresearch-x
+claude plugin install autoresearch-x@autoresearch-x
 
-# Register as a Claude Code plugin
-# (follow Claude Code plugin installation for your setup)
+# Or clone manually
+git clone https://github.com/waynejing995/autoresearch-x.git ~/.claude/plugins/autoresearch-x
 ```
 
-#### Manual Setup
+### Codex
 
-Copy the plugin contents into your Claude Code plugins directory:
-
+```bash
+git clone https://github.com/waynejing995/autoresearch-x.git ~/.codex/skills/autoresearch-x
 ```
-~/.claude/plugins/<marketplace>/plugins/autoresearch-x/
+
+### Other AI Tools
+
+Clone into your tool's plugin directory:
+
+```bash
+git clone https://github.com/waynejing995/autoresearch-x.git <your-plugin-dir>/autoresearch-x
+```
+
+### Update
+
+```bash
+cd ~/.claude/plugins/autoresearch-x && git pull
 ```
 
 ### Usage

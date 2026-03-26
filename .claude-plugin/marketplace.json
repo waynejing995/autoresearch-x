@@ -1,0 +1,39 @@
+{
+  "name": "autoresearch-x",
+  "owner": {
+    "name": "waynejing995"
+  },
+  "metadata": {
+    "description": "Iterate anything. Prove everything. Autonomous iteration engine with evidence-chain tracking.",
+    "version": "1.3.0"
+  },
+  "plugins": [
+    {
+      "name": "autoresearch-x",
+      "description": "Autonomous iteration engine with evidence-chain tracking for optimization, debugging, and investigation workflows.",
+      "version": "1.3.0",
+      "author": {
+        "name": "waynejing995"
+      },
+      "source": ".",
+      "repository": "https://github.com/waynejing995/autoresearch-x",
+      "license": "MIT",
+      "category": "development",
+      "keywords": [
+        "autonomous",
+        "iteration",
+        "autoresearch",
+        "debugging",
+        "optimization",
+        "investigation",
+        "evidence-chain",
+        "experiment-loop"
+      ],
+      "tags": [
+        "research",
+        "debug",
+        "automation"
+      ]
+    }
+  ]
+}
