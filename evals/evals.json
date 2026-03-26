@@ -1,0 +1,85 @@
+{
+  "skill_name": "autoresearch-x",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have a Python API server at scripts/dashboard_server.py that's getting slow. The /api/tasks endpoint used to respond in under 100ms but now it's taking 400ms+. I want to iterate on it overnight and wake up to a faster version. The benchmark script is at scripts/bench_api.py.",
+      "expected_output": "Triggers autoresearch-x in optimize mode. Asks about run tag, creates branch, establishes baseline, starts iterating with metric tracking."
+    },
+    {
+      "id": 2,
+      "prompt": "test_sync_jira keeps failing with a 403 error but only on Mondays. I've tried changing the auth token twice already and it doesn't help. Can you systematically debug this?",
+      "expected_output": "Triggers autoresearch-x in debug mode. Sets up observe phase first, tracks hypotheses, uses evidence matrix, only attempts fixes after diagnosis."
+    },
+    {
+      "id": 3,
+      "prompt": "I need to investigate why our GitHub webhook processing has been unreliable this month. Check the logs, look at the webhook delivery history, analyze failure patterns, and give me a report with evidence.",
+      "expected_output": "Triggers autoresearch-x in investigate mode. Gather phase first, analyze with evidence citations, Toulmin-structured findings."
+    },
+    {
+      "id": 4,
+      "prompt": "my dashboard is broken, sometimes it loads sometimes it doesn't, can you figure it out and fix it?",
+      "expected_output": "Should trigger autoresearch-x. Ambiguous mode — should ask user or infer debug mode (intermittent failure = needs diagnosis). Should NOT jump straight to fixing."
+    },
+    {
+      "id": 5,
+      "prompt": "optimize my code for readability, it's a mess right now",
+      "expected_output": "Tricky — no numeric metric. Should either refuse optimize mode and suggest a different approach, or propose a proxy metric (e.g., linting score, function length). Should NOT pretend it can measure readability numerically."
+    },
+    {
+      "id": 6,
+      "prompt": "rename the variable foo to bar in handler.py",
+      "expected_output": "Should NOT trigger autoresearch-x. Simple one-shot edit, no iteration needed."
+    },
+    {
+      "id": 7,
+      "prompt": "what does the sync_jira.py script do?",
+      "expected_output": "Should NOT trigger autoresearch-x. Read-only question, no iteration needed."
+    },
+    {
+      "id": 8,
+      "prompt": "I had an autoresearch-x run going on the API latency thing but my session died. Can you pick it up?",
+      "expected_output": "Should trigger autoresearch-x resume flow. Read existing .autoresearch-x/ directory, find results.tsv, identify last keep commit, continue from there."
+    },
+    {
+      "id": 9,
+      "prompt": "I've been debugging this memory leak for hours. I thought it was the cache but the fix didn't help. The cache hypothesis is wrong.",
+      "expected_output": "Should trigger autoresearch-x in debug mode. Should add diagnose discard row for cache hypothesis, fall back to observe for new data, NOT just try another fix."
+    },
+    {
+      "id": 10,
+      "prompt": "just keep trying stuff until the tests pass",
+      "expected_output": "Should trigger autoresearch-x but push back for specifics — which tests? what files? Should not blindly start modifying random code."
+    },
+    {
+      "id": 11,
+      "prompt": "add logging for both the auth middleware AND the database connection pool, I think the bug is in one of those two",
+      "expected_output": "Should trigger autoresearch-x debug mode observe phase. Should batch both logging additions in one commit (parallel observe). Should set up H1 and H2 in hypothesis matrix."
+    },
+    {
+      "id": 12,
+      "prompt": "fix the bug in handler.py but don't touch the database module",
+      "expected_output": "Should trigger autoresearch-x debug mode with explicit scope: modify handler.py, readonly database module. Should enforce scope throughout."
+    },
+    {
+      "id": 13,
+      "prompt": "optimize my API, I want it faster",
+      "expected_output": "Triggers autoresearch-x in optimize mode. Reviewer BLOCKs on: target not measurable (no numeric threshold), eval command missing. Main agent asks user targeted questions to fill in metric, target threshold, and eval command before showing program.md in Step G."
+    },
+    {
+      "id": 14,
+      "prompt": "/autoresearch-x --template optimize, then user provides scope with modify: scripts/bench.py where bench.py is also the eval command",
+      "expected_output": "Reviewer BLOCKs on circular eval: eval script scripts/bench.py is in modify scope. Main agent asks user to move it to readonly or use a separate eval script. Should NOT proceed to Step G until resolved."
+    },
+    {
+      "id": 15,
+      "prompt": "I have a Python API at src/server.py that responds in 400ms. Benchmark is scripts/bench.py. I want p99 under 200ms. Max 30 iterations, 1 hour timeout.",
+      "expected_output": "Triggers autoresearch-x optimize mode. Reviewer approves — target is measurable, eval command exists, scope is clear. Program.md shown to user in Step G without BLOCK questions. May include recommendations but no blockers."
+    },
+    {
+      "id": 16,
+      "prompt": "test_auth_login keeps failing. The test is at tests/test_auth.py. Debug it systematically.",
+      "expected_output": "Triggers autoresearch-x debug mode. Reviewer AUTO-FIXes missing pass/fail criteria to 'exit code 0 = pass'. Step G shows program.md with note: 'Auto-filled: pass/fail criteria set to exit code 0'. No BLOCK questions needed."
+    }
+  ]
+}

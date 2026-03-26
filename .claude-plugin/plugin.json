@@ -1,0 +1,21 @@
+{
+  "name": "autoresearch-x",
+  "version": "1.3.0",
+  "description": "Iterate anything. Prove everything. Autonomous iteration engine with evidence-chain tracking for optimization, debugging, and investigation workflows.",
+  "author": {
+    "name": "waynejing995"
+  },
+  "keywords": [
+    "autonomous",
+    "iteration",
+    "autoresearch",
+    "debugging",
+    "optimization",
+    "investigation",
+    "evidence-chain",
+    "experiment-loop"
+  ],
+  "skills": "./skills",
+  "agents": ["./agents/worker.md", "./agents/evaluator.md", "./agents/reviewer.md"],
+  "hooks": "./hooks/hooks.json"
+}
