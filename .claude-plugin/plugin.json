@@ -16,6 +16,5 @@
     "experiment-loop"
   ],
   "skills": "./skills",
-  "agents": ["./agents/worker.md", "./agents/evaluator.md", "./agents/reviewer.md"],
-  "hooks": "./hooks/hooks.json"
+  "agents": ["./agents/worker.md", "./agents/evaluator.md", "./agents/reviewer.md"]
 }
