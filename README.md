@@ -31,7 +31,8 @@ autoresearch-x enforces scientific rigor:
 Main Agent (orchestrator)
 ├── Worker subagent      — executes code changes (cannot see eval results)
 ├── Evaluator subagent   — runs eval commands (cannot see code changes)
-└── Reviewer subagent    — validates program.md before runs start
+├── Reviewer subagent    — validates program.md before runs start
+└── Strategist subagent  — dispatched after 5 consecutive discards to pivot strategy
 
 Guardrail Hooks
 ├── scope-guard          — blocks edits outside declared scope
@@ -204,7 +205,8 @@ autoresearch-x/
 ├── agents/
 │   ├── worker.md              # Code modification agent (isolated from eval)
 │   ├── evaluator.md           # Evaluation agent (isolated from code changes)
-│   └── reviewer.md            # Program.md validation agent
+│   ├── reviewer.md            # Program.md validation agent
+│   └── strategist.md          # Strategy pivot agent (dispatched on stall)
 ├── skills/
 │   └── autoresearch-x/
 │       ├── SKILL.md           # Main skill definition
@@ -212,6 +214,7 @@ autoresearch-x/
 │       ├── ref-debug-mode.md
 │       ├── ref-investigate-mode.md
 │       ├── ref-tracking.md
+│       ├── ref-branching.md   # Branching & strategy pivot reference
 │       └── templates/         # program.md templates & report formats
 ├── hooks/
 │   ├── hooks.json             # Hook registration
@@ -244,7 +247,7 @@ During a run, autoresearch-x creates:
 ## Autonomy & Safety
 
 - **Never-Stop Rule** — once started, runs autonomously until target met, budget exhausted, or human interrupts
-- **Stuck Protocol** — after 5 consecutive discards, automatically pivots strategy
+- **Stuck Protocol** — after 5 consecutive discards, automatically dispatches the Strategist subagent for a full strategy pivot with branching support
 - **Crash Handling** — quick fixes applied automatically; 3 consecutive crashes trigger a radically different approach
 - **Scope Guard** — hooks prevent modifications outside declared scope
 - **Completion Check** — cannot stop without writing a final report with conclusion
