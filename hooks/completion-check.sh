@@ -14,7 +14,8 @@ consume_stdin
 # Skip if no active run
 find_active_run || pass_silently
 
-# ─── Check 1: Last iteration fully recorded? ──────────────────────
+# ─── Check 1: Active branch's last iteration fully recorded? ──────
+# RESULTS_TSV and ITERATIONS_DIR now point to the active branch via lib.sh
 tsv_rows=$(get_iteration_count)
 
 if [[ "$tsv_rows" -gt 0 ]]; then
@@ -22,7 +23,7 @@ if [[ "$tsv_rows" -gt 0 ]]; then
 
     if [[ -n "$last_commit" ]]; then
         if [[ ! -f "$ITERATIONS_DIR/$last_commit.md" ]]; then
-            block_stop "Cannot stop: iterations/$last_commit.md is missing. The last iteration is not fully recorded. Create the detail file before stopping."
+            block_stop "Cannot stop: iterations/$last_commit.md is missing for branch '${ACTIVE_BRANCH:-main}'. Create the detail file before stopping."
         fi
     fi
 fi
@@ -54,8 +55,20 @@ fi
     mode=$(grep -A1 "^## Mode" "$PROGRAM_MD" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "unknown")
 
     echo "[autoresearch-x] Run '$RUN_TAG' ($mode mode) complete."
-    echo "  Iterations: $total total ($keeps kept, $discards discarded, $crashes crashed)"
-    echo "  Last metric: ${last_metric:--} | Target: $target_line"
+    echo "  Active branch: ${ACTIVE_BRANCH:-main}"
+
+    # If branches.tsv exists, show per-branch summary
+    if [[ -f "${BRANCHES_TSV:-}" ]]; then
+        echo "  Branches:"
+        while IFS=$'\t' read -r bid _ bstatus _ biters bmetric _ _; do
+            [[ "$bid" == "branch_id" ]] && continue
+            echo "    $bid: $bstatus ($biters iters, best: ${bmetric:--})"
+        done < "$BRANCHES_TSV"
+    else
+        echo "  Iterations: $total total ($keeps kept, $discards discarded, $crashes crashed)"
+        echo "  Last metric: ${last_metric:--} | Target: $target_line"
+    fi
+
     echo "  Report: $ACTIVE_RUN_DIR/report.md"
     echo ""
     echo "  REMINDER: Deactivate hooks by running: bash \${CLAUDE_PLUGIN_ROOT}/hooks/run-control.sh deactivate"

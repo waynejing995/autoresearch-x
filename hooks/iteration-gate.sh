@@ -37,13 +37,28 @@ fi
 # against results.tsv row count. A gap means an iteration was committed
 # but never recorded in results.tsv.
 #
-# Only count commits since the run branch diverged from its parent.
-# The branch is autoresearch-x/<tag>, find the merge-base to scope the count.
-run_branch="autoresearch-x/$RUN_TAG"
-merge_base=$(git merge-base "$run_branch" "$run_branch@{upstream}" 2>/dev/null \
-    || git merge-base "$run_branch" main 2>/dev/null \
-    || git merge-base "$run_branch" master 2>/dev/null \
-    || echo "")
+# Branch-aware merge-base detection:
+# For fork branches: count commits since the checkpoint tag (fork point)
+# For main branch: count commits since the run branch diverged (original logic)
+merge_base=""
+
+if [[ "${ACTIVE_BRANCH:-main}" != "main" && -f "${BRANCHES_TSV:-}" ]]; then
+    # Read parent_checkpoint for this branch from branches.tsv
+    parent_cp=$(awk -F'\t' -v bid="$ACTIVE_BRANCH" '$1==bid {print $2}' "$BRANCHES_TSV")
+    if [[ -n "$parent_cp" && "$parent_cp" != "-" ]]; then
+        # Use the checkpoint tag as merge-base
+        merge_base=$(git rev-parse "checkpoint/$parent_cp" 2>/dev/null || echo "")
+    fi
+fi
+
+# Fallback: original logic for main branch or if checkpoint not found
+if [[ -z "$merge_base" ]]; then
+    run_branch="autoresearch-x/$RUN_TAG"
+    merge_base=$(git merge-base "$run_branch" "$run_branch@{upstream}" 2>/dev/null \
+        || git merge-base "$run_branch" main 2>/dev/null \
+        || git merge-base "$run_branch" master 2>/dev/null \
+        || echo "")
+fi
 
 if [[ -n "$merge_base" ]]; then
     iter_commits=$(git log --oneline "$merge_base"..HEAD 2>/dev/null | grep -cE "^[a-f0-9]+ iter [0-9]" || echo 0)

@@ -1,6 +1,6 @@
 {
   "name": "autoresearch-x",
-  "version": "1.3.1",
+  "version": "2.1.0",
   "description": "Iterate anything. Prove everything. Autonomous iteration engine with evidence-chain tracking for optimization, debugging, and investigation workflows.",
   "author": {
     "name": "waynejing995"
@@ -23,6 +23,7 @@
   "agents": [
     "./agents/worker.md",
     "./agents/evaluator.md",
-    "./agents/reviewer.md"
+    "./agents/reviewer.md",
+    "./agents/strategist.md"
   ]
 }

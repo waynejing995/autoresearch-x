@@ -14,7 +14,8 @@ consume_stdin() {
 
 # ─── Active Run Detection ──────────────────────────────────────────
 # Finds the active run directory. Returns 1 if no run is active.
-# Sets: ACTIVE_RUN_DIR, RUN_TAG, PROGRAM_MD, RESULTS_TSV, ITERATIONS_DIR
+# Sets: ACTIVE_RUN_DIR, RUN_TAG, ACTIVE_BRANCH, PROGRAM_MD,
+#       RESULTS_TSV, ITERATIONS_DIR, BRANCHES_TSV
 find_active_run() {
     local project_dir="${CLAUDE_PROJECT_DIR:-.}"
     local base_dir="$project_dir/.autoresearch-x"
@@ -26,16 +27,39 @@ find_active_run() {
     local active_file="$base_dir/.active"
     [[ -f "$active_file" ]] || return 1
 
-    # .active contains the run tag
-    RUN_TAG=$(cat "$active_file")
-    [[ -n "$RUN_TAG" ]] || return 1
+    local active_content
+    active_content=$(cat "$active_file")
+    [[ -n "$active_content" ]] || return 1
+
+    # Parse <tag>:<branch_id> format
+    # Backward compat: no colon = tag only, assume main branch
+    if [[ "$active_content" == *:* ]]; then
+        RUN_TAG="${active_content%%:*}"
+        ACTIVE_BRANCH="${active_content#*:}"
+    else
+        RUN_TAG="$active_content"
+        ACTIVE_BRANCH="main"
+    fi
 
     ACTIVE_RUN_DIR="$base_dir/$RUN_TAG"
     [[ -d "$ACTIVE_RUN_DIR" ]] || return 1
 
     PROGRAM_MD="$ACTIVE_RUN_DIR/program.md"
-    RESULTS_TSV="$ACTIVE_RUN_DIR/results.tsv"
-    ITERATIONS_DIR="$ACTIVE_RUN_DIR/iterations"
+
+    # Branch-aware path resolution:
+    # If branches/<branch_id>/ exists → use branch-specific paths
+    # Otherwise → fall back to top-level (v1 compat / single-branch run)
+    local branch_dir="$ACTIVE_RUN_DIR/branches/$ACTIVE_BRANCH"
+    if [[ -d "$branch_dir" ]]; then
+        RESULTS_TSV="$branch_dir/results.tsv"
+        ITERATIONS_DIR="$branch_dir/iterations"
+    else
+        RESULTS_TSV="$ACTIVE_RUN_DIR/results.tsv"
+        ITERATIONS_DIR="$ACTIVE_RUN_DIR/iterations"
+    fi
+
+    # Branch registry path (may not exist in v1 runs)
+    BRANCHES_TSV="$ACTIVE_RUN_DIR/branches.tsv"
 
     return 0
 }

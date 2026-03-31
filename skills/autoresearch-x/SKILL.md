@@ -51,6 +51,7 @@ BEFORE PROCEEDING: Read the reference files for your selected mode.
 - investigate: <reference>MUST READ: ref-investigate-mode.md</reference>
 
 All modes: <reference>MUST READ: ref-tracking.md</reference>
+Branching (v2): <reference>MUST READ: ref-branching.md</reference>
 
 ## Setup Phase
 
@@ -159,9 +160,15 @@ Auto-generate the `## Checklist` based on mode and answers:
 - **debug**: observe (add logging) → diagnose (test hypotheses) → fix (apply solution)
 - **investigate**: one checklist item per question/topic from the target
 5. **Parse checklist** — extract items from program.md, initialize tracking.
-6. **Create `.autoresearch-x/<tag>/`** — results.tsv (header only), report.md (skeleton), iterations/ directory.
+6. **Create `.autoresearch-x/<tag>/`** — directory structure for branching:
+   - `branches/main/results.tsv` (header only)
+   - `branches/main/iterations/` directory
+   - `branches.tsv` (header + initial main row: `main\t-\tactive\t1.0\t0\t-\t0\t<timestamp>`)
+   - `all-results.tsv` (header only — same as results.tsv but with `branch_id` column prepended)
+   - `report.md` (skeleton)
+   - Archive program.md as `program.v1.md`
 7. **Add to .gitignore** — append `.autoresearch-x/` to project root `.gitignore` if not present. Create `.autoresearch-x/.gitignore` containing `!*`.
-8. **Activate guardrail hooks** — run `bash ${CLAUDE_PLUGIN_ROOT}/hooks/run-control.sh activate <tag>` to enable iteration discipline hooks. This creates `.autoresearch-x/.active` which activates scope-guard, iteration-gate, eval-bypass-detector, and completion-check hooks.
+8. **Activate guardrail hooks** — run `bash ${CLAUDE_PLUGIN_ROOT}/hooks/run-control.sh activate <tag>` to enable iteration discipline hooks. This writes `<tag>:main` to `.autoresearch-x/.active` which activates scope-guard, iteration-gate, eval-bypass-detector, and completion-check hooks.
 9. **Verify prerequisites** — eval command runs, scope files exist, dependencies available.
 10. **Establish baseline** — first run with no changes. Record baseline metric.
 11. **Confirm with user** — show setup summary, then go autonomous.
@@ -205,9 +212,47 @@ optimize | debug | investigate
 
 ---
 
-# ★ THE ITERATION LOOP ★
+# ★ THE OUTER LOOP (Branch Manager) ★
 
-This is the core of autoresearch-x. Everything above is setup. **This section governs every iteration.**
+The Branch Manager wraps the inner iteration loop, handling branch selection, switching, forking, and mind explosion. See `ref-branching.md` for full details.
+
+```
+OUTER LOOP:
+  1. READ branches.tsv → compute priorities for all non-stalled, non-pruned branches
+  2. SELECT highest-priority branch
+  3. SWITCH to that branch:
+     a. Clean working tree check (git stash if dirty)
+     b. git checkout autoresearch-x/<tag>/<branch_id>
+     c. bash ${CLAUDE_PLUGIN_ROOT}/hooks/run-control.sh switch-branch <branch_id>
+  4. RUN inner loop for K iterations (default K=3)
+     - Worker receives cross-branch summary from all-results.tsv
+     - EARLY EXIT: if branch hits 5 consecutive discards, stop inner loop, mark stalled
+     - FORK CANDIDATES: record in pending_forks list (deferred — no immediate fork)
+  5. UPDATE branches.tsv (priority, metrics, stall_count)
+     Rebuild all-results.tsv (merge all branches/*/results.tsv)
+  6. CREATE PENDING FORKS (deferred from inner Step 1):
+     - For each: verify limits (max 8 branches, max 3 fork depth)
+     - git tag checkpoint/cp-NNN, create branch, init tracking dir
+     - Add row to branches.tsv with status=suspended
+  7. CHECK GLOBAL STALL:
+     - If ALL branches stalled: trigger Strategist (mind explosion)
+     - See ref-branching.md for full Strategist dispatch and program revision gate
+  8. CHECK COMPLETION:
+     - If any branch completed: generate final report, stop
+     - If total iterations >= max_iterations: stop
+     - If mind explosions >= 3 with all still stalled: stop
+  9. GOTO 1
+```
+
+**Cross-branch context for Workers:** Before dispatching a Worker, build a summary from `all-results.tsv` of what other branches tried and their outcomes. Include as `## Cross-Branch Context (read-only)` in the Worker prompt. This prevents redundant exploration.
+
+**Single-branch runs:** If no forks are created, the outer loop just selects `main` every time — functionally identical to v1.
+
+---
+
+# ★ THE INNER ITERATION LOOP ★
+
+This is the core of autoresearch-x. Everything above is setup. **This section governs every iteration within a branch.**
 
 <HARD-GATE>
 EACH ITERATION = EXACTLY ONE EXPERIMENTAL IDEA
@@ -248,7 +293,7 @@ Before EVERY iteration, verify:
 - [ ] About to try EXACTLY ONE change? (not two, not three)
 - [ ] Will dispatch to Worker? (not write code myself)
 - [ ] Will dispatch to Evaluator? (not run eval myself)
-- [ ] Budget remaining? (show: `[iter N/max | N remaining | best: X | target: Y]`), if no remaining budget, abort!!!!
+- [ ] Budget remaining? (show: `[iter N/max | N remaining | best: X | target: Y | branch: <id>]`), count total iterations across ALL branches, if no remaining budget, abort!!!!
 - [ ] Total time remaining? (read program.md for start time & total timeout, show `[start: X | remaining: Y]`), if no remaining budget, abort!!!!
 
 ## The 9-Step Protocol
@@ -270,13 +315,15 @@ REPEAT until target met or budget exhausted or timeout:
 
 For debug mode, also state the phase (observe/diagnose/fix), target hypothesis, and which evidence supports this direction.
 
+**Fork candidate detection:** If you identify 2+ genuinely different root strategies (not parameter variations), record them in `pending_forks` but do NOT fork immediately. Pick one strategy for this iteration. Forks are created by the outer loop between branch visits. See `ref-branching.md` for fork rules.
+
 ### Step 2: DISPATCH WORKER
 
 ```
 Agent(subagent_type="autoresearch-x:worker", prompt="...", description="iter N: ...")
 ```
 
-Include: program.md content, ONE instruction, scope, phase, previous iteration descriptions (NO metrics).
+Include: program.md content, ONE instruction, scope, phase, previous iteration descriptions (NO metrics), and **cross-branch summary** (one-line summaries of what other branches tried, from `all-results.tsv`).
 
 Worker reports: files changed, lines modified, observations.
 
@@ -352,14 +399,18 @@ Once the loop begins, do NOT pause to ask "should I continue?" Work autonomously
 - **Investigate:** all checklist items resolved with evidence
 - **Budget exhausted** or **human interrupts**
 
-## Stuck Protocol
+## Branch Stall Detection (replaces v1 Stuck Protocol)
 
-If **5 consecutive iterations** produce no `keep`:
-1. Re-read program.md for new angles
-2. Try combining previous near-miss approaches
-3. Try radically different approaches
-4. Log "stuck" in report.md
-5. Continue with new plan until budget exhausted, DON'T STOP!!!!
+If **5 consecutive iterations** on the current branch produce no `keep`:
+1. **Stop the inner loop immediately** (do not complete remaining K iterations)
+2. Mark the branch as `stalled` in `branches.tsv` (stall_count = 5)
+3. Log "branch stalled" in report.md
+4. Return control to the outer loop (Branch Manager)
+   - The outer loop will switch to a higher-priority branch
+   - If ALL branches are stalled, the outer loop triggers a **mind explosion** (Strategist agent)
+   - See `ref-branching.md` for the full Strategist protocol
+
+Do NOT attempt within-branch recovery (no ad-hoc pivots). Recovery happens at the outer loop level.
 
 ## Crash Handling
 
@@ -381,9 +432,13 @@ a `## Conclusion` section. Complete ALL steps below before stopping.
 
 1. **Finalize report.md** — add a `## Conclusion` section at the end with:
    - **Outcome:** whether the target was met (YES/NO + evidence)
-   - **Statistics:** total iterations, keeps, discards, crashes
-   - **Best result:** the best metric achieved and which commit produced it
+   - **Statistics:** total iterations (across all branches), keeps, discards, crashes
+   - **Branch summary:** per-branch stats (iterations, best metric, final status)
+   - **Best result:** the best metric achieved, which branch and commit produced it
    - **Key findings:** (optimize) what worked and why; (debug) root cause and fix; (investigate) answers to each checklist question
+   - **Gitgraph:** mermaid gitGraph visualization of the full branch tree (see `ref-branching.md`)
+   - **Cross-branch analysis:** what strategies worked, what failed, and shared failure patterns
+   - **Mind explosions:** if any occurred, summarize strategist proposals and their outcomes
    - **Recommendations:** next steps if target not met, or how to maintain gains if it was
    - **Timeline:** start time, end time, total duration
 

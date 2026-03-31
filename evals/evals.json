@@ -80,6 +80,41 @@
       "id": 16,
       "prompt": "test_auth_login keeps failing. The test is at tests/test_auth.py. Debug it systematically.",
       "expected_output": "Triggers autoresearch-x debug mode. Reviewer AUTO-FIXes missing pass/fail criteria to 'exit code 0 = pass'. Step G shows program.md with note: 'Auto-filled: pass/fail criteria set to exit code 0'. No BLOCK questions needed."
+    },
+    {
+      "id": 17,
+      "prompt": "I'm optimizing my image processing pipeline in scripts/pipeline.py. The benchmark is scripts/bench_pipeline.py and I want throughput above 500 img/s. I think there are two very different approaches: vectorize the pixel operations with numpy, or parallelize across images with multiprocessing. I want to explore both.",
+      "expected_output": "Triggers autoresearch-x optimize mode. During setup, initializes branches.tsv with main branch. During iteration, when the agent encounters the two diverging strategies (vectorize vs parallelize), it should record fork candidates in pending_forks and create a checkpoint + two fork branches in the outer loop. Should NOT try both approaches on the same branch."
+    },
+    {
+      "id": 18,
+      "prompt": "I've been running autoresearch-x to optimize my parser but it's been stuck for a while. All 3 branches (main, fork-vectorize, fork-cache) have stalled with 5+ discards each. What happens next?",
+      "expected_output": "Should recognize this as a global stall condition. Should explain the mind explosion / Strategist protocol: all branch evidence is reviewed, external research is done, 4-round brainstorming produces new strategies, and optionally a revised program.md is proposed for user approval. Should NOT suggest just 'trying harder' on the same branches."
+    },
+    {
+      "id": 19,
+      "prompt": "/autoresearch-x resume my-optimization-run, but the run has branches. I was on fork-2 when my session died.",
+      "expected_output": "Should resume by reading branches.tsv and .active file to determine the last active branch. Should restore branch context, read the active branch's results.tsv, and continue the outer loop from where it left off. Should show branch status summary."
+    },
+    {
+      "id": 20,
+      "prompt": "I'm optimizing my API. After 10 iterations on main branch, the metric has barely moved (312ms to 305ms, target is 200ms). I feel like the approach is wrong — should I change the program.md scope to include the database layer too?",
+      "expected_output": "Should NOT let the user manually edit program.md mid-run without going through the proper flow. Should explain that if the branch stalls (5 consecutive discards), the Strategist agent will analyze failure patterns and can propose scope changes through the reviewer + human gate. Alternatively, the user can trigger a mind explosion early if they believe the current approach is exhausted."
+    },
+    {
+      "id": 21,
+      "prompt": "The Strategist just proposed expanding scope to include database/queries.py and changing the eval command to 'python bench_full.py'. Before we apply these changes, what validation happens?",
+      "expected_output": "Should explain the Program Revision Gate: (1) the reviewer subagent is dispatched on the revised program.md draft, with the changed sections (Scope, Evaluation) marked as inferred_sections for extra scrutiny, (2) the reviewer runs its 4-pass validation (target clarity, feasibility — checks that database/queries.py exists via Glob, eval rules — checks that bench_full.py is runnable, anti-patterns — checks that bench_full.py is not in modify scope), (3) if the reviewer finds BLOCK issues they must be resolved before presenting to the user, (4) the human gate presents the diff for user approval. Should NOT skip the reviewer."
+    },
+    {
+      "id": 22,
+      "prompt": "After mind explosion, the Strategist proposes adding scripts/eval_runner.py to the modify scope, but that's also the eval command script. What should happen?",
+      "expected_output": "The reviewer subagent should catch this as a circular eval anti-pattern (Pass 4, item 1): the eval script is in the modify scope, meaning the agent could game its own evaluation. The reviewer should BLOCK this change. The main agent should resolve it by either removing the file from modify scope or asking the user to use a separate eval script. The revised program.md should NOT be presented to the user with this flaw."
+    },
+    {
+      "id": 23,
+      "prompt": "The Strategist wants to change the target from 'p99 latency < 200ms' to just 'make it faster'. Should this go through?",
+      "expected_output": "The reviewer subagent should catch this in Pass 1 (Target Clarity): the target 'make it faster' is purely subjective with no numeric threshold, which is a BLOCK in optimize mode. The main agent should reject the target change and either keep the original target or ask the Strategist/user for a measurable replacement. The reviewer must run before the human gate — vague targets should never reach the user for approval."
     }
   ]
 }

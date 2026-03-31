@@ -17,17 +17,29 @@ file_path=$(echo "$HOOK_INPUT" | jq -r '.tool_input.file_path // empty')
 
 [[ -n "$file_path" ]] || pass_silently
 
-# ─── Rule 1: Never touch tracking files ───────────────────────────
+# ─── Rule 1: Never touch tracking files (except allowed ones) ─────
 if [[ "$file_path" == *".autoresearch-x/"* ]]; then
     # Extract the path after the run-tag directory
     tracking_path="${file_path##*.autoresearch-x/*/}"
     case "$tracking_path" in
+        # v1 paths (backward compat)
         results.tsv|report.md|matrix.md|iterations/*.md|program.md)
-            # These are tracking artifacts the main agent IS supposed to write
+            pass_silently
+            ;;
+        # v2 branch-specific paths
+        branches/*/results.tsv|branches/*/iterations/*.md)
+            pass_silently
+            ;;
+        # v2 top-level tracking files
+        branches.tsv|all-results.tsv|program.v*.md)
+            pass_silently
+            ;;
+        # v2 strategist output
+        strategist/explosion-*.yaml|strategist/research-notes/*.md)
             pass_silently
             ;;
         *)
-            deny_tool_use "Cannot modify tracking file '$file_path'. Only results.tsv, report.md, matrix.md, iterations/*.md, and program.md are allowed."
+            deny_tool_use "Cannot modify tracking file '$file_path'. Allowed: results.tsv, report.md, matrix.md, iterations/*.md, program.md, branches.tsv, all-results.tsv, branches/*/results.tsv, branches/*/iterations/*.md, strategist/*, program.v*.md"
             ;;
     esac
 fi
