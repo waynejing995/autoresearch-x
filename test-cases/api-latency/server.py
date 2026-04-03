@@ -73,20 +73,14 @@ def get_items(
     end = start + size
     page_items = records[start:end]
 
-    result_str = ""
-    for item in page_items:
-        result_str += json.dumps(item) + ","
-    result_str = "[" + result_str.rstrip(",") + "]"
-
-    parsed = json.loads(result_str)
-    return JSONResponse(content={"items": parsed, "total": len(records)})
+    return JSONResponse(content={"items": page_items, "total": len(records)})
 
 
 @app.get("/api/items/{item_id}")
 def get_item(item_id: int):
     r = _id_index.get(item_id)
     if r:
-        return JSONResponse(content=json.loads(json.dumps(r)))
+        return JSONResponse(content=r)
     return JSONResponse(content={"error": "not found"}, status_code=404)
 
 
