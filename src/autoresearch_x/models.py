@@ -43,6 +43,8 @@ class IterationPhase(str, Enum):
 class Decision(str, Enum):
     KEEP = "keep"
     DISCARD = "discard"
+    DIGGING = "digging"      # INVESTIGATE: 持续深挖中
+    BRANCHING = "branching"  # INVESTIGATE: 换方向/分支
 
 
 class TeammateRole(str, Enum):
@@ -103,6 +105,7 @@ class RunState(BaseModel):
     scope: List[str] = Field(default_factory=list)
     readonly: List[str] = Field(default_factory=list)
     current_phase: Optional[str] = None  # debug/observe/diagnose/fix, gather/analyze/conclude
+    phase_iteration: int = 0  # iterations within current phase (reset on phase transition)
     status: str = "running"
 
     @field_validator("tag")
@@ -446,3 +449,65 @@ def parse_teammate_output(content: str) -> Dict[str, Any]:
         }
 
     raise ValueError("Cannot parse teammate output: no JSON or status found")
+
+
+# ---------------------------------------------------------------------------
+# Planner Output Schema (structured decision record)
+# ---------------------------------------------------------------------------
+
+
+class PlannerSummaryStatus(str, Enum):
+    """Valid status values for Planner's structured summary block."""
+    OBSERVATION = "observation"
+    DIAGNOSIS_COMPLETE = "diagnosis_complete"
+    FIX_PROPOSED = "fix_proposed"
+    GATHER_COMPLETE = "gather_complete"
+    GATHER_MORE = "gather_more"
+    ANALYSIS_COMPLETE = "analysis_complete"
+    CONCLUSION_READY = "conclusion_ready"
+    REINVESTIGATE = "reinvestigate"
+
+
+class PlannerSummary(BaseModel):
+    """Schema for Planner's structured summary block (after --- separator)."""
+    status: PlannerSummaryStatus
+    files: List[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+def parse_planner_summary(text: str) -> tuple[Optional[PlannerSummary], str]:
+    """Parse the structured summary block from Planner output.
+
+    Looks for a YAML block after '---' separator at the end of the text.
+    Returns (summary, error_msg). If parsing succeeds, error_msg is empty.
+    If no summary block found, returns (None, "no summary block found").
+    """
+    # Find the last '---' separator — try multiple patterns
+    parts = text.rsplit("\n---\n", 1)
+    if len(parts) < 2:
+        parts = text.rsplit("\n---", 1)
+    if len(parts) < 2:
+        parts = text.split("---\n", 1)  # handle --- at start of text
+    if len(parts) < 2:
+        return None, "No '---' summary block found in output"
+
+    yaml_block = parts[1].strip()
+    if not yaml_block:
+        return None, "Summary block is empty"
+
+    # Parse YAML-style key: value pairs
+    try:
+        import yaml
+        data = yaml.safe_load(yaml_block)
+    except Exception as e:
+        return None, f"YAML parse error: {e}"
+
+    if not isinstance(data, dict):
+        return None, f"Summary block is not a dict (got {type(data).__name__})"
+
+    # Validate with Pydantic
+    try:
+        summary = PlannerSummary.model_validate(data)
+        return summary, ""
+    except Exception as e:
+        return None, f"Schema validation failed: {e}"

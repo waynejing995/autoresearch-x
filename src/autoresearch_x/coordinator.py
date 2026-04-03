@@ -15,8 +15,8 @@ import click
 from loguru import logger
 
 from .branch_manager import BranchManager
-from .models import Decision, ResultRow, RunMode, RunState
-from .program_parser import parse_program_md
+from .models import Decision, PlannerSummaryStatus, ResultRow, RunMode, RunState, parse_planner_summary
+from .program_parser import generate_program_md, parse_program
 from .sdk_teammate import run_teammate_sync
 from .state_manager import StateManager
 
@@ -47,10 +47,20 @@ def run(
     proj = Path(project_dir) if project_dir else Path.cwd()
     program_file = Path(program_path)
     if not program_file.exists():
-        logger.error(f"program.md not found: {program_path}")
+        logger.error(f"Program file not found: {program_path}")
         sys.exit(1)
 
-    parsed = parse_program_md(program_file)
+    parsed = parse_program(program_file)
+
+    # If YAML input, generate program.md as human-readable output
+    if program_file.suffix in (".yaml", ".yml"):
+        generated_md = proj / "program.md"
+        generated_md.write_text(generate_program_md(parsed))
+        program_md_path = str(generated_md)
+        logger.info(f"Generated program.md from {program_path}")
+    else:
+        program_md_path = str(program_file)
+
     if not tag:
         tag = _generate_tag(parsed.get("mode", "optimize"), parsed.get("target_desc", ""))
 
@@ -60,7 +70,7 @@ def run(
         tag=tag,
         mode=RunMode(parsed["mode"]) if parsed["mode"] else RunMode.OPTIMIZE,
         target=parsed["target_desc"],
-        program_md_path=str(program_file),
+        program_md_path=program_md_path,
         eval_command=parsed["eval_command"],
         metric_name=parsed["metric_name"],
         target_expr=parsed["target"],
@@ -193,6 +203,25 @@ Propose your plan as plain text with these sections:
 2. **Rationale**: Why this change should improve the metric, referencing prior iteration evidence
 3. **Files**: List of files the Worker should modify
 4. **Lesson** (optional): New insight to append to program.md
+
+After your analysis, you MUST append a structured summary block separated by `---`.
+Use this exact format:
+
+---
+status: observation | diagnosis_complete | fix_proposed
+files: [path/to/file1, path/to/file2]
+reason: Brief explanation of your decision
+
+Status values:
+- `observation`: Still gathering data, no specific fix identified yet
+- `diagnosis_complete`: Root cause identified, ready for Worker to implement fix
+- `fix_proposed`: Specific fix plan with files identified
+
+Example:
+---
+status: diagnosis_complete
+files: [drivers/gpu/drm/amd/amdgpu/amdgpu_device.c]
+reason: GPU hang traced to missing timeout handler in device reset path
 """
 
 _WORKER_PROMPT = """\
@@ -350,50 +379,79 @@ def _run_loop(
         # ── Git commit (before eval, so eval tests the committed code) ─
         commit = _git_commit_all(proj, state.iteration_count + 1)
 
-        # ── Evaluator ────────────────────────────────────────────────
-        eval_text = _run_evaluator(state, state_mgr, proj, max_turns, debug_dump)
-        if eval_text is None:
-            logger.error("Evaluator failed")
-            if state.crash_count >= MAX_AGENT_RETRIES - 1:
-                logger.error(f"Evaluator retry limit reached ({MAX_AGENT_RETRIES}), aborting")
-                state.status = "agent_retry_exhausted"
+        # ── Evaluator (skip for INVESTIGATE — no metric, no eval) ─────
+        if state.mode == RunMode.INVESTIGATE:
+            eval_text = ""
+            metric_value = None
+            target_met = False
+            decision = Decision.DIGGING  # placeholder — ignored by INVESTIGATE's phase transition
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"INVESTIGATE iter {state.iteration_count + 1}: skipping Evaluator")
+            logger.info(f"{'=' * 60}")
+        else:
+            eval_text = _run_evaluator(state, state_mgr, proj, max_turns, debug_dump)
+            if eval_text is None:
+                logger.error("Evaluator failed")
+                if state.crash_count >= MAX_AGENT_RETRIES - 1:
+                    logger.error(f"Evaluator retry limit reached ({MAX_AGENT_RETRIES}), aborting")
+                    state.status = "agent_retry_exhausted"
+                    state_mgr.save_state(state)
+                    break
+                state.crash_count += 1
                 state_mgr.save_state(state)
-                break
-            state.crash_count += 1
-            state_mgr.save_state(state)
-            continue
+                continue
 
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"EVALUATOR (iter {state.iteration_count + 1}):")
-        logger.info(f"{'=' * 60}")
-        logger.info(eval_text)
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"EVALUATOR (iter {state.iteration_count + 1}):")
+            logger.info(f"{'=' * 60}")
+            logger.info(eval_text)
 
-        # ── Parse metric from eval text ──────────────────────────────
-        metric_value = _extract_metric(eval_text, state.metric_name)
-        target_met = state.is_target_met(metric_value)
+            # ── Parse metric from eval text ──────────────────────────────
+            metric_value = _extract_metric(eval_text, state.metric_name)
+            target_met = state.is_target_met(metric_value)
 
-        # ── Decide ───────────────────────────────────────────────────
-        decision = _decide(state, metric_value)
+            # ── Decide ───────────────────────────────────────────────────
+            decision = _decide(state, metric_value)
 
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"DECISION (iter {state.iteration_count + 1}):")
-        logger.info(f"{'=' * 60}")
-        logger.info(f"Commit: {commit}")
-        logger.info(f"Metric: {metric_value} (target: {state.target_expr})")
-        logger.info(f"Target met: {target_met}")
-        logger.info(f"Decision: {decision.value}")
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"DECISION (iter {state.iteration_count + 1}):")
+            logger.info(f"{'=' * 60}")
+            logger.info(f"Commit: {commit}")
+            logger.info(f"Metric: {metric_value} (target: {state.target_expr})")
+            logger.info(f"Target met: {target_met}")
+            logger.info(f"Decision: {decision.value}")
 
-        # ── Act on decision ──────────────────────────────────────────
-        if decision == Decision.DISCARD:
-            logger.info(f"Reverting changes from commit {commit}")
-            _git_revert(proj, commit)
+            # ── Act on decision ──────────────────────────────────────────
+            if decision == Decision.DISCARD:
+                logger.info(f"Reverting changes from commit {commit}")
+                _git_revert(proj, commit)
+
+        # ── Phase transition (unified: forward + backward) ──────────
+        old_phase = getattr(state, "current_phase", None)
+        _transition_phase(state, planner_text=planner_text, decision=decision)
 
         # ── Record ───────────────────────────────────────────────────
         desc = _extract_change_description(planner_text)
-        _record(state, state_mgr, commit, decision, metric_value, desc, next_branch.branch_id)
+        if state.mode == RunMode.INVESTIGATE:
+            # INVESTIGATE: BRANCHING on backward transition, DIGGING otherwise
+            _PHASE_ORDER = {"gather": 0, "analyze": 1, "conclude": 2}
+            new_phase = getattr(state, "current_phase", None)
+            is_backward = (
+                old_phase is not None
+                and new_phase is not None
+                and _PHASE_ORDER.get(new_phase, 0) < _PHASE_ORDER.get(old_phase, 0)
+            )
+            record_decision = Decision.BRANCHING if is_backward else Decision.DIGGING
+            _record(state, state_mgr, commit, record_decision, metric_value, desc, next_branch.branch_id)
+        else:
+            _record(state, state_mgr, commit, decision, metric_value, desc, next_branch.branch_id)
 
         # ── Update state ─────────────────────────────────────────────
-        if decision == Decision.KEEP:
+        if state.mode == RunMode.INVESTIGATE:
+            # INVESTIGATE: no keep/discard semantics, always keep findings
+            state.consecutive_discards = 0
+        elif decision == Decision.KEEP:
             state.consecutive_discards = 0
             if metric_value is not None:
                 if state.best_metric is None or _is_better(
@@ -442,34 +500,62 @@ def _run_planner(
         planner_scope.append(state.program_md_path)
     planner_scope.append(".autoresearch-x/")
 
-    try:
-        result = run_teammate_sync(
-            prompt=prompt,
-            project_dir=str(proj),
-            max_turns=max_turns,
-            allowed_tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "Bash",
-                "Grep",
-                "Glob",
-                "LS",
-                "WebFetch",
-                "WebSearch",
-            ],
-            readonly=state.readonly,
-            scope=planner_scope,
-        )
-    except Exception as e:
-        logger.error(f"Planner SDK error: {e}")
-        return None
+    max_retries = 8
+    last_text = None
 
-    if debug_dump:
-        dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-raw.json"
-        dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
+    for attempt in range(max_retries):
+        try:
+            result = run_teammate_sync(
+                prompt=prompt,
+                project_dir=str(proj),
+                max_turns=max_turns,
+                allowed_tools=[
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Bash",
+                    "Grep",
+                    "Glob",
+                    "LS",
+                    "WebFetch",
+                    "WebSearch",
+                ],
+                readonly=state.readonly,
+                scope=planner_scope,
+            )
+        except Exception as e:
+            logger.error(f"Planner SDK error (attempt {attempt + 1}): {e}")
+            return None
 
-    return result.get_full_text() or None
+        text = result.get_full_text() or ""
+        last_text = text
+
+        if debug_dump:
+            dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-attempt-{attempt + 1}-raw.json"
+            dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
+
+        # Schema check
+        ok, error = check_planner_output(text)
+        if ok:
+            summary, _ = parse_planner_summary(text)
+            status = summary.status.value if summary else "unknown"
+            logger.info(f"Planner output schema valid (attempt {attempt + 1}): status={status}")
+            return text
+
+        # Schema check failed — append error feedback for retry
+        logger.warning(f"Planner output schema invalid (attempt {attempt + 1}): {error}")
+        if attempt < max_retries - 1:
+            prompt = (
+                text
+                + f"\n\n[Format Error] Your output summary block failed validation: {error}\n"
+                "Please re-output your full analysis with the correct summary block format.\n"
+                "Remember: the block after '---' must contain 'status', 'files', and 'reason' fields.\n"
+                "status must be one of: observation, diagnosis_complete, fix_proposed"
+            )
+
+    # All retries exhausted — return last output with warning
+    logger.error(f"Planner output schema invalid after {max_retries} attempts, using last output")
+    return last_text
 
 
 def _run_worker(
@@ -732,6 +818,178 @@ def _resolve_phase(state: RunState) -> str:
         return getattr(state, "current_phase", None) or "gather"
     else:  # optimize
         return "baseline" if iteration == 0 else "iterate"
+
+
+# Phase transition thresholds (configurable per mode)
+_PHASE_TRANSITION_RULES = {
+    RunMode.DEBUG: {
+        # observe → diagnose: after N iterations of observation
+        ("observe", "diagnose"): 8,
+        # diagnose → fix: triggered by Planner summary block (not iteration count)
+        ("diagnose", "fix"): None,
+    },
+    RunMode.INVESTIGATE: {
+        # Planner-driven transitions (threshold=None → planner status drives)
+        ("gather", "analyze"): None,
+        ("analyze", "conclude"): None,
+    },
+}
+
+
+def _extract_planner_decision(text: str) -> Optional[dict]:
+    """Extract structured decision block from Planner output using schema validation.
+
+    Uses parse_planner_summary() which validates against PlannerSummary Pydantic model.
+    Returns dict with status/files/reason, or None if no valid block found.
+    """
+    if not text:
+        return None
+
+    summary, error = parse_planner_summary(text)
+    if summary is None:
+        return None
+
+    return {
+        "status": summary.status.value,
+        "files": summary.files,
+        "reason": summary.reason,
+    }
+
+
+def check_planner_output(text: str) -> tuple[bool, str]:
+    """Validate Planner output format. Returns (pass, error_msg).
+
+    pass=True means the output contains a valid YAML summary block after '---'.
+    error_msg is empty when pass=True.
+    """
+    if not text or not text.strip():
+        return False, "Output is empty"
+
+    summary, error = parse_planner_summary(text)
+    if summary is None:
+        return False, error
+
+    # Additional semantic checks
+    if summary.status == PlannerSummaryStatus.DIAGNOSIS_COMPLETE and not summary.files:
+        return False, "status is 'diagnosis_complete' but 'files' list is empty — must specify which files to modify"
+    if summary.status == PlannerSummaryStatus.FIX_PROPOSED and not summary.files:
+        return False, "status is 'fix_proposed' but 'files' list is empty — must specify which files to modify"
+    if summary.status == PlannerSummaryStatus.GATHER_COMPLETE and not summary.files:
+        return False, "status is 'gather_complete' but 'files' list is empty — must specify which files were gathered"
+    if summary.status == PlannerSummaryStatus.ANALYSIS_COMPLETE and not summary.files:
+        return False, "status is 'analysis_complete' but 'files' list is empty — must specify which files were analyzed"
+
+    return True, ""
+
+
+def _should_advance_phase(
+    status: PlannerSummaryStatus, from_phase: str, to_phase: str
+) -> bool:
+    """Determine if planner status should trigger a phase advance.
+
+    Maps planner status values to forward phase transitions.
+    Backward transitions (GATHER_MORE, REINVESTIGATE) are handled
+    directly in _transition_phase().
+    """
+    _ADVANCE_MAP = {
+        # DEBUG mode
+        ("observe", "diagnose"): {PlannerSummaryStatus.DIAGNOSIS_COMPLETE},
+        ("diagnose", "fix"): {PlannerSummaryStatus.FIX_PROPOSED},
+        # INVESTIGATE mode
+        ("gather", "analyze"): {PlannerSummaryStatus.GATHER_COMPLETE},
+        ("analyze", "conclude"): {PlannerSummaryStatus.ANALYSIS_COMPLETE},
+    }
+    allowed = _ADVANCE_MAP.get((from_phase, to_phase), set())
+    return status in allowed
+
+
+def _transition_phase(
+    state: RunState,
+    planner_text: Optional[str] = None,
+    decision: Optional[Decision] = None,
+) -> bool:
+    """Unified phase state machine. Call once per iteration, after decide step.
+
+    Backward (takes priority):
+    1. Decision-driven (DEBUG only): fix → observe (KEEP or DISCARD)
+    2. Planner-driven (INVESTIGATE only): analyze → gather (GATHER_MORE), conclude → gather (REINVESTIGATE)
+
+    Forward (both modes, via _should_advance_phase):
+    - DEBUG: observe→diagnose (threshold 8), diagnose→fix (FIX_PROPOSED)
+    - INVESTIGATE: gather→analyze (GATHER_COMPLETE), analyze→conclude (ANALYSIS_COMPLETE)
+
+    Returns True if phase was transitioned.
+    """
+    if state.mode == RunMode.OPTIMIZE:
+        return False
+
+    current = getattr(state, "current_phase", None)
+    if not current:
+        return False
+
+    moved = False
+
+    # 1a. Decision-driven backward (DEBUG only)
+    if state.mode == RunMode.DEBUG and decision is not None and current == "fix":
+        if decision == Decision.KEEP:
+            state.current_phase = "observe"
+            state.phase_iteration = 0
+            logger.info("Phase transition: fix → observe (KEEP, re-observe after change)")
+            moved = True
+        elif decision == Decision.DISCARD:
+            state.current_phase = "observe"
+            state.phase_iteration = 0
+            logger.info("Phase transition: fix → observe (DISCARD, re-observe)")
+            moved = True
+
+    # 1b. Planner-driven backward (INVESTIGATE only)
+    if not moved and state.mode == RunMode.INVESTIGATE and planner_text:
+        summary, _ = parse_planner_summary(planner_text)
+        if summary:
+            if current == "analyze" and summary.status == PlannerSummaryStatus.GATHER_MORE:
+                state.current_phase = "gather"
+                state.phase_iteration = 0
+                logger.info("Phase transition: analyze → gather (planner status=gather_more, fall back)")
+                moved = True
+            elif current == "conclude" and summary.status == PlannerSummaryStatus.REINVESTIGATE:
+                state.current_phase = "gather"
+                state.phase_iteration = 0
+                logger.info("Phase transition: conclude → gather (planner status=reinvestigate, re-investigate)")
+                moved = True
+
+    # 2. Planner-driven forward transitions (only if no backward happened)
+    if not moved:
+        rules = _PHASE_TRANSITION_RULES.get(state.mode, {})
+        for (from_phase, to_phase), threshold in rules.items():
+            if from_phase != state.current_phase:
+                continue
+            if threshold is not None:
+                # Iteration-based transition
+                if state.phase_iteration >= threshold:
+                    state.current_phase = to_phase
+                    logger.info(
+                        f"Phase transition: {from_phase} → {to_phase} "
+                        f"(phase_iter {state.phase_iteration} >= {threshold})"
+                    )
+                    state.phase_iteration = 0
+                    moved = True
+            elif planner_text:
+                # Planner-decision-based transition
+                summary, _ = parse_planner_summary(planner_text)
+                if summary and _should_advance_phase(summary.status, from_phase, to_phase):
+                    state.current_phase = to_phase
+                    logger.info(
+                        f"Phase transition: {from_phase} → {to_phase} "
+                        f"(planner status={summary.status.value})"
+                    )
+                    state.phase_iteration = 0
+                    moved = True
+            break
+
+    # Increment phase iteration
+    state.phase_iteration += 1
+
+    return moved
 
 
 def _record(
