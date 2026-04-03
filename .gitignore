@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.autoresearch-x/
+.claude/commands/
+.claude/skills/
+.codex/
+.gstack/
+.opencode/
+CLAUDE.md
+openspec/
+test-cases/api-latency/__pycache__/
+test-cases/api-latency/data/
+tests/__pycache__/
