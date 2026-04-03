@@ -1,6 +1,5 @@
 import hashlib
 import json
-import time
 from pathlib import Path
 
 from fastapi import FastAPI, Query
@@ -47,8 +46,6 @@ def get_items(
     page: int = Query(default=1, ge=1),
     size: int = Query(default=100, ge=1, le=1000),
 ):
-    time.sleep(0.05)
-
     records = _load_records()
 
     if category:
@@ -69,8 +66,6 @@ def get_items(
 
 @app.get("/api/items/{item_id}")
 def get_item(item_id: int):
-    time.sleep(0.02)
-
     records = _load_records()
     for r in records:
         if r["id"] == item_id:
@@ -81,8 +76,6 @@ def get_item(item_id: int):
 
 @app.get("/api/stats")
 def get_stats():
-    time.sleep(0.03)
-
     records = _load_records()
 
     categories = {}
