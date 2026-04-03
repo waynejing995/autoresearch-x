@@ -172,9 +172,20 @@ Analyze the iteration history and propose ONE change to optimize the target metr
 - Write to program.md to update lessons learned and tips (e.g., "Lesson: GPU test suite requires sudo for device access")
 
 ## Forbidden Actions
-- Do NOT modify any source code files
+- Do NOT edit any source code files
 - Do NOT run evaluation or build commands
 - Do NOT modify state.json, results.tsv, or branches.tsv
+
+## Learning Updates
+When the iteration history reveals useful lessons (e.g. a technique that worked well,
+a pattern that consistently fails, a performance gotcha, a useful constraint), update
+program.md to record them. Use the following format in program.md:
+
+## Lessons Learned
+- [iter N] <what was learned>
+
+You MAY directly edit program.md to append lessons learned — this is the only project
+file you are allowed to modify directly. Write your update using the Edit tool.
 
 ## Output Format
 Propose your plan as plain text with these sections:
@@ -203,9 +214,11 @@ Readonly: {readonly}
 - Run diagnostic Bash commands (e.g., grep, git diff) — no builds
 
 ## Forbidden Actions
-- Do NOT modify files outside scope or marked as readonly
-- Do NOT run evaluation commands (the Evaluator does that)
-- Do NOT modify program.md, state.json, results.tsv, or branches.tsv
+- Do NOT modify files outside scope
+- Do NOT touch readonly files
+- Do NOT run the eval command (that's the Evaluator's job)
+- Do NOT modify program.md or .autoresearch-x/ tracking files
+- Do NOT make multiple changes — ONE change per iteration
 
 ## Output Format
 After implementing, output a plain text summary with:
@@ -233,6 +246,21 @@ Run the evaluation command and report the metric.
 ## Forbidden Actions
 - Do NOT modify source code files
 - Do NOT modify program.md, state.json, results.tsv, or branches.tsv
+
+## Eval Log
+After running the eval command, write a structured eval log to
+.autoresearch-x/eval-logs/<timestamp>.md with the following format:
+
+# Eval Log — Iteration <N>
+- **Command:** <eval_command>
+- **Metric (<metric_name>):** <value>
+- **Target (<target_expr>):** <met / not met>
+- **Exit code:** <code>
+
+## Output (key lines)
+<last 20 lines of eval command output>
+
+Use the Write tool to create this log file.
 
 ## Output Format
 Output a plain text report with:
@@ -408,8 +436,11 @@ def _run_planner(
         history_text=history_text,
     )
 
-    # Planner: readonly everything except program.md (if set)
-    planner_scope = [state.program_md_path] if state.program_md_path else []
+    # Planner: can write to program.md and .autoresearch-x/
+    planner_scope = []
+    if state.program_md_path:
+        planner_scope.append(state.program_md_path)
+    planner_scope.append(".autoresearch-x/")
 
     try:
         result = run_teammate_sync(
@@ -427,6 +458,7 @@ def _run_planner(
                 "WebFetch",
                 "WebSearch",
             ],
+            readonly=state.readonly,
             scope=planner_scope,
         )
     except Exception as e:
@@ -497,9 +529,8 @@ def _run_evaluator(
         target_expr=state.target_expr,
     )
 
-    # Evaluator: can only write to eval-logs directory
-    eval_logs_dir = f".autoresearch-x/{state.tag}/eval-logs/"
-    evaluator_scope = [eval_logs_dir]
+    # Evaluator: can only write to .autoresearch-x/ directory
+    evaluator_scope = [".autoresearch-x/"]
 
     try:
         result = run_teammate_sync(
@@ -517,6 +548,7 @@ def _run_evaluator(
                 "WebFetch",
                 "WebSearch",
             ],
+            readonly=state.readonly,
             scope=evaluator_scope,
         )
     except Exception as e:
