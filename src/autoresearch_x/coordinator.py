@@ -21,14 +21,12 @@ from .models import (
     ResultRow,
     RunMode,
     RunState,
-    TeammateRole,
-    TeammateStatus,
     WorkerResult,
-    parse_teammate_output,
+    extract_json_from_result,
 )
 from .program_parser import parse_program_md
+from .sdk_teammate import TeammateResult, extract_json_from_result, run_teammate_sync
 from .state_manager import StateManager
-from .teammate_manager import TeammateManager
 
 
 @click.group()
@@ -84,16 +82,10 @@ def run(
         timeout_minutes=parsed["timeout_minutes"],
     )
 
-    team_name = f"autoresearch-x:{tag}"
-    tm = TeammateManager(
-        team_name=team_name,
-        max_turns=max_turns,
-        idle_timeout=idle_timeout,
-    )
     branch_mgr = BranchManager(state_mgr, str(proj))
 
     logger.info(f"Starting run: tag={tag} mode={state.mode.value} target={state.target}")
-    _run_loop(state, state_mgr, tm, branch_mgr, proj, debug_dump=debug_dump)
+    _run_loop(state, state_mgr, branch_mgr, proj, max_turns=max_turns, debug_dump=debug_dump)
 
 
 @cli.command()
@@ -109,12 +101,10 @@ def resume(tag: str, project_dir: Optional[str]) -> None:
 
     state_mgr = StateManager(run_dir)
     state = state_mgr.load_state()
-    team_name = f"autoresearch-x:{tag}"
-    tm = TeammateManager(team_name=team_name)
     branch_mgr = BranchManager(state_mgr, str(proj))
 
     logger.info(f"Resuming run: tag={tag} iteration={state.iteration_count}")
-    _run_loop(state, state_mgr, tm, branch_mgr, proj)
+    _run_loop(state, state_mgr, branch_mgr, proj)
 
 
 @cli.command()
@@ -180,9 +170,9 @@ def cleanup(project_dir: Optional[str], days: int) -> None:
 def _run_loop(
     state: RunState,
     state_mgr: StateManager,
-    tm: TeammateManager,
     branch_mgr: BranchManager,
     proj: Path,
+    max_turns: int = 20,
     debug_dump: bool = False,
 ) -> None:
     """Main iteration loop."""
@@ -207,17 +197,14 @@ def _run_loop(
             branch_mgr.mark_stalled(next_branch.branch_id)
             if branch_mgr.is_globally_stalled():
                 logger.info("All branches stalled — triggering Strategist")
-                _trigger_strategist(state, state_mgr, tm, branch_mgr, proj)
+                _trigger_strategist(state, state_mgr, branch_mgr, proj, max_turns)
             continue
 
         state_mgr.clear_outbox()
 
-        planner_result = _run_planner(state, state_mgr, tm, proj)
+        planner_result = _run_planner(state, state_mgr, proj, max_turns, debug_dump)
         if planner_result is None:
-            agent_name = f"planner-iter-{state.iteration_count + 1}"
-            exit_code = tm.get_exit_code(agent_name)
-            raw_log = tm.get_raw_log(agent_name)[-500:]
-            logger.error(f"Planner failed (exit={exit_code}): {raw_log}")
+            logger.error("Planner failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Planner retry limit reached ({MAX_AGENT_RETRIES}), aborting")
                 state.status = "agent_retry_exhausted"
@@ -229,12 +216,9 @@ def _run_loop(
 
         state.crash_count = 0
 
-        worker_result = _run_worker(state, state_mgr, tm, planner_result, proj)
+        worker_result = _run_worker(state, state_mgr, planner_result, proj, max_turns, debug_dump)
         if worker_result is None:
-            agent_name = f"worker-iter-{state.iteration_count + 1}"
-            exit_code = tm.get_exit_code(agent_name)
-            raw_log = tm.get_raw_log(agent_name)[-500:]
-            logger.error(f"Worker failed (exit={exit_code}): {raw_log}")
+            logger.error("Worker failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Worker retry limit reached ({MAX_AGENT_RETRIES}), aborting")
                 state.status = "agent_retry_exhausted"
@@ -244,12 +228,9 @@ def _run_loop(
             state_mgr.save_state(state)
             continue
 
-        eval_result = _run_evaluator(state, state_mgr, tm, proj)
+        eval_result = _run_evaluator(state, state_mgr, proj, max_turns, debug_dump)
         if eval_result is None:
-            agent_name = f"evaluator-iter-{state.iteration_count + 1}"
-            exit_code = tm.get_exit_code(agent_name)
-            raw_log = tm.get_raw_log(agent_name)[-500:]
-            logger.error(f"Evaluator failed (exit={exit_code}): {raw_log}")
+            logger.error("Evaluator failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Evaluator retry limit reached ({MAX_AGENT_RETRIES}), aborting")
                 state.status = "agent_retry_exhausted"
@@ -295,188 +276,163 @@ def _run_loop(
 def _run_planner(
     state: RunState,
     state_mgr: StateManager,
-    tm: TeammateManager,
     proj: Path,
-    debug_dump: bool = False,
+    max_turns: int,
+    debug_dump: bool,
 ) -> Optional[PlannerResult]:
     program_text = Path(state.program_md_path).read_text() if state.program_md_path else ""
-    task = {
-        "role": "planner",
-        "iteration": state.iteration_count + 1,
-        "task": "Analyze history and propose ONE change to reduce latency",
-        "state_path": str(state_mgr.state_path),
-        "results_path": str(state_mgr.results_path),
-        "iterations_dir": str(state_mgr.iterations_dir),
-        "program_md": program_text,
-    }
-    state_mgr.write_inbox("planner", task)
-
-    outbox_path = state_mgr.outbox_dir / "planner.json"
     prompt = (
-        f"Read the task from {state_mgr.inbox_dir / 'planner.json'}. "
-        f"Execute the task. "
-        f"Write your result as a JSON object to {outbox_path}. "
-        f"Then output ONLY the JSON object, wrapped in ```json code blocks."
+        f"You are the Planner in an autoresearch-x iteration loop.\n\n"
+        f"## Task\n"
+        f"Analyze the iteration history and propose ONE change to reduce latency.\n\n"
+        f"## Context\n"
+        f"- State: {state_mgr.state_path}\n"
+        f"- Results: {state_mgr.results_path}\n"
+        f"- Iterations dir: {state_mgr.iterations_dir}\n\n"
+        f"## Program\n"
+        f"{program_text}\n\n"
+        f"## Output\n"
+        f"Write your result as a JSON object to {state_mgr.outbox_dir / 'planner.json'}:\n"
+        f"```json\n"
+        f'{{"status": "success", "plan": {{"change_description": "...", "rationale": "...", "expected_signal": "...", "files_to_modify": [...]}}}}\n'
+        f"```"
     )
-    agent_name = tm.spawn(
-        TeammateRole.PLANNER,
-        state.iteration_count + 1,
-        prompt,
-        str(proj),
-    )
-    status = tm.wait_for_idle(agent_name)
-    logger.info(f"Planner status: {status.value}")
-    if status != TeammateStatus.IDLE:
-        return None
 
-    # Primary: read the outbox file the agent wrote
-    raw_output = state_mgr.read_outbox("planner") or ""
-
-    # Fallback: extract from Claude's JSON envelope
-    if not raw_output:
-        raw_output, raw_envelope = tm.get_output(agent_name)
-        if debug_dump and raw_envelope:
-            dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-raw.json"
-            dump_file.write_text(raw_envelope)
-            logger.info(f"Dumped raw envelope to {dump_file}")
-
-    if debug_dump and raw_output:
-        dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-output.txt"
-        dump_file.write_text(raw_output)
-        logger.info(f"Dumped planner output to {dump_file}")
-
-    if not raw_output:
-        logger.error("Planner produced no output at all")
-        return None
     try:
-        data = parse_teammate_output(raw_output)
+        result = run_teammate_sync(
+            prompt=prompt,
+            project_dir=str(proj),
+            max_turns=max_turns,
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+        )
+    except Exception as e:
+        logger.error(f"Planner SDK error: {e}")
+        return None
+
+    if debug_dump:
+        dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-raw.json"
+        dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
+        logger.info(f"Dumped planner raw messages to {dump_file}")
+
+    data = extract_json_from_result(result)
+    if data is None:
+        logger.error(
+            f"Planner produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
+        )
+        return None
+
+    try:
         return PlannerResult(**data)
     except Exception as e:
-        logger.error(f"Failed to parse planner output: {e}")
-        logger.debug(f"Raw output that failed: {raw_output[:1000]}")
-        return None
-    try:
-        data = parse_teammate_output(raw_output)
-        return PlannerResult(**data)
-    except Exception as e:
-        logger.error(f"Failed to parse planner output: {e}")
-        logger.debug(f"Raw output that failed: {raw_output[:1000]}")
+        logger.error(f"Failed to parse planner result: {e}")
         return None
 
 
 def _run_worker(
     state: RunState,
     state_mgr: StateManager,
-    tm: TeammateManager,
     plan: PlannerResult,
     proj: Path,
-    debug_dump: bool = False,
+    max_turns: int,
+    debug_dump: bool,
 ) -> Optional[WorkerResult]:
     plan_data = plan.plan or {}
-    task = {
-        "role": "worker",
-        "iteration": state.iteration_count + 1,
-        "task": "Execute the planned change",
-        "plan": plan_data,
-        "scope": state.scope,
-        "readonly": state.readonly,
-        "program_md": Path(state.program_md_path).read_text() if state.program_md_path else "",
-    }
-    state_mgr.write_inbox("worker", task)
-
-    outbox_path = state_mgr.outbox_dir / "worker.json"
     prompt = (
-        f"Read the task from {state_mgr.inbox_dir / 'worker.json'}. "
-        f"Execute the task. "
-        f"Write your result as a JSON object to {outbox_path}. "
-        f"Then output ONLY the JSON object, wrapped in ```json code blocks."
+        f"You are the Worker in an autoresearch-x iteration loop.\n\n"
+        f"## Task\n"
+        f"Execute the planned change.\n\n"
+        f"## Plan\n"
+        f"{json.dumps(plan_data, indent=2)}\n\n"
+        f"## Scope\n"
+        f"Only modify: {', '.join(state.scope) if state.scope else 'any file'}\n"
+        f"Readonly: {', '.join(state.readonly) if state.readonly else 'none'}\n\n"
+        f"## Output\n"
+        f"Write your result as a JSON object to {state_mgr.outbox_dir / 'worker.json'}:\n"
+        f"```json\n"
+        f'{{"status": "success", "files_modified": [...], "changes_summary": "...", "observations": "..."}}\n'
+        f"```"
     )
-    agent_name = tm.spawn(
-        TeammateRole.WORKER,
-        state.iteration_count + 1,
-        prompt,
-        str(proj),
-    )
-    status = tm.wait_for_idle(agent_name)
-    logger.info(f"Worker status: {status.value}")
-    if status != TeammateStatus.IDLE:
-        return None
 
-    raw_output = state_mgr.read_outbox("worker") or ""
-    if not raw_output:
-        raw_output, raw_envelope = tm.get_output(agent_name)
-        if debug_dump and raw_envelope:
-            dump_file = state_mgr.run_dir / f"worker-iter-{state.iteration_count + 1}-raw.json"
-            dump_file.write_text(raw_envelope)
-            logger.info(f"Dumped worker raw envelope to {dump_file}")
-
-    if debug_dump and raw_output:
-        dump_file = state_mgr.run_dir / f"worker-iter-{state.iteration_count + 1}-output.txt"
-        dump_file.write_text(raw_output)
-        logger.info(f"Dumped worker output to {dump_file}")
-
-    if not raw_output:
-        logger.error("Worker produced no output at all")
-        return None
     try:
-        data = parse_teammate_output(raw_output)
+        result = run_teammate_sync(
+            prompt=prompt,
+            project_dir=str(proj),
+            max_turns=max_turns,
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+        )
+    except Exception as e:
+        logger.error(f"Worker SDK error: {e}")
+        return None
+
+    if debug_dump:
+        dump_file = state_mgr.run_dir / f"worker-iter-{state.iteration_count + 1}-raw.json"
+        dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
+        logger.info(f"Dumped worker raw messages to {dump_file}")
+
+    data = extract_json_from_result(result)
+    if data is None:
+        logger.error(
+            f"Worker produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
+        )
+        return None
+
+    try:
         return WorkerResult(**data)
     except Exception as e:
-        logger.error(f"Failed to parse worker output: {e}")
-        logger.debug(f"Raw output that failed: {raw_output[:1000]}")
+        logger.error(f"Failed to parse worker result: {e}")
         return None
 
 
 def _run_evaluator(
     state: RunState,
     state_mgr: StateManager,
-    tm: TeammateManager,
     proj: Path,
+    max_turns: int,
+    debug_dump: bool,
 ) -> Optional[EvaluatorResult]:
-    task = {
-        "role": "evaluator",
-        "iteration": state.iteration_count + 1,
-        "task": "Run evaluation and extract metric",
-        "eval_command": state.eval_command,
-        "metric_name": state.metric_name,
-        "target": state.target_expr,
-    }
-    state_mgr.write_inbox("evaluator", task)
-
-    outbox_path = state_mgr.outbox_dir / "evaluator.json"
     prompt = (
-        f"Read the task from {state_mgr.inbox_dir / 'evaluator.json'}. "
-        f"Execute the task. "
-        f"Write your result as a JSON object to {outbox_path}. "
-        f"Then output ONLY the JSON object, wrapped in ```json code blocks."
+        f"You are the Evaluator in an autoresearch-x iteration loop.\n\n"
+        f"## Task\n"
+        f"Run the evaluation command and extract the metric.\n\n"
+        f"## Evaluation\n"
+        f"- Command: {state.eval_command}\n"
+        f"- Metric: {state.metric_name}\n"
+        f"- Target: {state.target_expr}\n\n"
+        f"## Output\n"
+        f"Run the command, extract the metric, and write your result as JSON to "
+        f"{state_mgr.outbox_dir / 'evaluator.json'}:\n"
+        f"```json\n"
+        f'{{"status": "success", "exit_code": 0, "metric_value": 123.4, "target_met": false, "extraction_method": "grep", "peak_output": "..."}}\n'
+        f"```"
     )
-    agent_name = tm.spawn(
-        TeammateRole.EVALUATOR,
-        state.iteration_count + 1,
-        prompt,
-        str(proj),
-    )
-    status = tm.wait_for_idle(agent_name)
-    logger.info(f"Evaluator status: {status.value}")
-    if status != TeammateStatus.IDLE:
-        return None
 
-    raw_output, _ = tm.get_output(agent_name)
-    if raw_output:
-        logger.debug(f"Evaluator raw output: {raw_output[:500]}")
-    else:
-        raw_output = state_mgr.read_outbox("evaluator") or ""
-        logger.debug(f"Evaluator outbox fallback: {raw_output[:500]}")
-
-    if not raw_output:
-        logger.error("Evaluator produced no output at all")
-        return None
     try:
-        data = parse_teammate_output(raw_output)
+        result = run_teammate_sync(
+            prompt=prompt,
+            project_dir=str(proj),
+            max_turns=max_turns,
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+        )
+    except Exception as e:
+        logger.error(f"Evaluator SDK error: {e}")
+        return None
+
+    if debug_dump:
+        dump_file = state_mgr.run_dir / f"evaluator-iter-{state.iteration_count + 1}-raw.json"
+        dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
+        logger.info(f"Dumped evaluator raw messages to {dump_file}")
+
+    data = extract_json_from_result(result)
+    if data is None:
+        logger.error(
+            f"Evaluator produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
+        )
+        return None
+
+    try:
         return EvaluatorResult(**data)
     except Exception as e:
-        logger.error(f"Failed to parse evaluator output: {e}")
-        logger.debug(f"Raw output that failed: {raw_output[:1000]}")
+        logger.error(f"Failed to parse evaluator result: {e}")
         return None
 
 
@@ -574,35 +530,32 @@ def _record(
 def _trigger_strategist(
     state: RunState,
     state_mgr: StateManager,
-    tm: TeammateManager,
     branch_mgr: BranchManager,
     proj: Path,
+    max_turns: int,
 ) -> None:
-    task = {
-        "role": "strategist",
-        "task": "Analyze all branch failures and propose new strategies",
-        "all_results_path": str(state_mgr.all_results_path),
-        "program_md_path": state.program_md_path,
-        "branches_path": str(state_mgr.branches_path),
-        "iterations_dir": str(state_mgr.iterations_dir),
-    }
-    state_mgr.write_inbox("strategist", task)
-
-    agent_name = tm.spawn(
-        TeammateRole.STRATEGIST,
-        state.iteration_count + 1,
-        f"Read {state_mgr.inbox_dir / 'strategist.json'} and execute the task",
-        str(proj),
+    prompt = (
+        f"You are the Strategist. All branches are stalled.\n\n"
+        f"Analyze all branch failures and propose new strategies.\n\n"
+        f"## Results\n"
+        f"{state_mgr.all_results_path.read_text() if state_mgr.all_results_path.exists() else 'No results'}\n\n"
+        f"## Program\n"
+        f"{Path(state.program_md_path).read_text() if state.program_md_path else ''}\n\n"
+        f"## Branches\n"
+        f"{state_mgr.branches_path.read_text() if state_mgr.branches_path.exists() else 'No branches'}"
     )
-    status = tm.wait_for_idle(agent_name, timeout=600)
-    if status == TeammateStatus.IDLE:
-        output = state_mgr.read_outbox("strategist")
-        if output:
-            try:
-                data = parse_teammate_output(output)
-                logger.info(f"Strategist analysis complete: {json.dumps(data, indent=2)[:500]}")
-            except Exception:
-                pass
+
+    try:
+        result = run_teammate_sync(
+            prompt=prompt,
+            project_dir=str(proj),
+            max_turns=max_turns,
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+        )
+        logger.info(f"Strategist analysis: {result.get_full_text()[:500]}")
+    except Exception as e:
+        logger.error(f"Strategist SDK error: {e}")
+
     state.mind_explosions += 1
     state_mgr.save_state(state)
 
@@ -622,20 +575,20 @@ def _write_final_report(
     lines = [
         f"# Final Report: {state.tag}",
         "",
-        "## Outcome",
+        f"## Outcome",
         f"- **Target:** {state.target}",
         f"- **Status:** {state.status}",
         f"- **Best metric:** {state.best_metric}",
         f"- **Best commit:** {state.best_commit}",
         "",
-        "## Statistics",
+        f"## Statistics",
         f"- **Total iterations:** {state.iteration_count}",
         f"- **Keeps:** {keeps}",
         f"- **Discards:** {discards}",
         f"- **Crashes:** {state.crash_count}",
         f"- **Mind explosions:** {state.mind_explosions}",
         "",
-        "## Branch Summary",
+        f"## Branch Summary",
     ]
     for b in branches:
         lines.append(
@@ -643,7 +596,7 @@ def _write_final_report(
         )
 
     lines.append("")
-    lines.append("## Timeline")
+    lines.append(f"## Timeline")
     lines.append(f"- **Started:** {state.started_at}")
     lines.append(f"- **Ended:** {datetime.now(timezone.utc).isoformat()}")
 
