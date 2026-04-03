@@ -715,6 +715,25 @@ def _is_better(new_val: float, old_val: float, target_expr: str) -> bool:
     return False
 
 
+def _resolve_phase(state: RunState) -> str:
+    """Resolve phase string based on run mode and iteration count.
+
+    - optimize: baseline (iter 0) → iterate
+    - debug: observe → diagnose → fix (driven by checklist in program.md)
+    - investigate: gather → analyze → conclude
+    """
+    mode = state.mode
+    iteration = state.iteration_count
+
+    if mode == RunMode.DEBUG:
+        # Debug mode: phase derived from current_phase in state, default observe
+        return getattr(state, "current_phase", None) or "observe"
+    elif mode == RunMode.INVESTIGATE:
+        return getattr(state, "current_phase", None) or "gather"
+    else:  # optimize
+        return "baseline" if iteration == 0 else "iterate"
+
+
 def _record(
     state: RunState,
     state_mgr: StateManager,
@@ -725,7 +744,7 @@ def _record(
     branch_id: str,
 ) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
-    phase = "baseline" if state.iteration_count == 0 else "iterate"
+    phase = _resolve_phase(state)
     metric_str = str(metric_value) if metric_value is not None else "-"
 
     row = ResultRow(

@@ -102,6 +102,7 @@ class RunState(BaseModel):
     target_expr: str = ""
     scope: List[str] = Field(default_factory=list)
     readonly: List[str] = Field(default_factory=list)
+    current_phase: Optional[str] = None  # debug/observe/diagnose/fix, gather/analyze/conclude
     status: str = "running"
 
     @field_validator("tag")

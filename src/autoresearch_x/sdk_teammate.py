@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,6 +52,7 @@ def _build_scope_hook(
 
     - Blocks Write/Edit on readonly files
     - Blocks Write/Edit outside scope (if scope is set)
+    - Blocks Bash commands that write files outside scope (sed -i, tee, cp, mv, etc.)
     - Allows all other tools
     """
 
@@ -62,38 +64,28 @@ def _build_scope_hook(
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
 
-        if tool_name not in ("Write", "Edit"):
-            return {}
+        # ── Write / Edit: direct file path check ──
+        if tool_name in ("Write", "Edit"):
+            file_path = tool_input.get("file_path", "")
+            if not file_path:
+                return {}
+            return _check_file_path(file_path, readonly, scope)
 
-        file_path = tool_input.get("file_path", "")
-        if not file_path:
-            return {}
-
-        # Normalize to relative path for matching
-        rel_path = _normalize_path(file_path)
-
-        # Check readonly
-        for ro in readonly:
-            if _path_matches(rel_path, ro):
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": f"File '{rel_path}' is readonly",
-                    }
-                }
-
-        # Check scope (if set, only allow files within scope)
-        if scope:
-            allowed = any(_path_matches(rel_path, s) for s in scope)
-            if not allowed:
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": f"File '{rel_path}' is outside scope",
-                    }
-                }
+        # ── Bash: detect file-writing commands ──
+        if tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if not command:
+                return {}
+            write_targets = _extract_bash_write_targets(command)
+            for target in write_targets:
+                result = _check_file_path(target, readonly, scope)
+                if result:
+                    # Override reason to mention Bash
+                    reason = result.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+                    result["hookSpecificOutput"]["permissionDecisionReason"] = (
+                        f"Bash command writes to '{target}': {reason}"
+                    )
+                    return result
 
         return {}
 
@@ -101,8 +93,85 @@ def _build_scope_hook(
         "PreToolUse": [
             HookMatcher(matcher="Write", hooks=[_scope_guard]),
             HookMatcher(matcher="Edit", hooks=[_scope_guard]),
+            HookMatcher(matcher="Bash", hooks=[_scope_guard]),
         ],
     }
+
+
+def _check_file_path(
+    file_path: str,
+    readonly: list[str],
+    scope: Optional[list[str]],
+) -> dict:
+    """Check a file path against readonly and scope rules. Returns hook response or empty dict."""
+    rel_path = _normalize_path(file_path)
+
+    # Check readonly
+    for ro in readonly:
+        if _path_matches(rel_path, ro):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"File '{rel_path}' is readonly",
+                }
+            }
+
+    # Check scope (if set, only allow files within scope)
+    if scope:
+        allowed = any(_path_matches(rel_path, s) for s in scope)
+        if not allowed:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"File '{rel_path}' is outside scope",
+                }
+            }
+
+    return {}
+
+
+# Patterns that indicate Bash commands writing to files
+_BASH_WRITE_PATTERNS = [
+    # sed -i file / sed -i 's/.../' file
+    re.compile(r'\bsed\s+(-[^\s]*i[^\s]*\s+).*?\s+(\S+)\s*$'),
+    # echo ... > file / echo ... >> file
+    re.compile(r'(?:echo|printf)\s+.*?[>]{1,2}\s*(\S+)'),
+    # tee file / tee -a file
+    re.compile(r'\btee\s+(-a\s+)?(\S+)'),
+    # cp src dst (dst is the write target)
+    re.compile(r'\bcp\s+.*?\s+(\S+)\s*$'),
+    # mv src dst (dst is the write target)
+    re.compile(r'\bmv\s+.*?\s+(\S+)\s*$'),
+    # cat ... > file
+    re.compile(r'\bcat\s+.*?[>]{1,2}\s*(\S+)'),
+    # dd of=file
+    re.compile(r'\bdd\s+.*?\bof=(\S+)'),
+    # install src dst
+    re.compile(r'\binstall\s+.*?\s+(\S+)\s*$'),
+]
+
+
+def _extract_bash_write_targets(command: str) -> list[str]:
+    """Extract file paths that a Bash command writes to.
+
+    Returns empty list if no file writes detected (e.g., grep, git diff, make).
+    """
+    targets = []
+    # Split on pipes and semicolons — check each subcommand
+    segments = re.split(r'[|;]', command)
+    for segment in segments:
+        segment = segment.strip()
+        for pattern in _BASH_WRITE_PATTERNS:
+            m = pattern.search(segment)
+            if m:
+                # Get the last group that looks like a file path
+                for group in m.groups():
+                    if group and not group.startswith("-") and ("/" in group or "." in group):
+                        targets.append(group)
+                        break
+    return targets
 
 
 def _normalize_path(p: str) -> str:
