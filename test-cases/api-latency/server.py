@@ -11,6 +11,7 @@ DATA_FILE = Path(__file__).parent / "data" / "records.json"
 _records_cache = None
 _id_index = {}  # O(1) lookup by id
 _category_index = {}  # O(1) lookup by category
+_stats_cache = None  # Cached stats result
 
 
 def _load_records():
@@ -35,6 +36,26 @@ def _build_indexes(records):
         _category_index[cat].append(r)
 
 
+def _compute_stats(records):
+    """Precompute stats at startup since data is static."""
+    global _stats_cache
+    categories = {}
+    for r in records:
+        cat = r["category"]
+        if cat not in categories:
+            categories[cat] = {"count": 0, "total_value": 0}
+        categories[cat]["count"] += 1
+        categories[cat]["total_value"] += r["value"]
+
+    data_hash = hashlib.md5(json.dumps(records).encode()).hexdigest()
+
+    _stats_cache = {
+        "categories": categories,
+        "total_records": len(records),
+        "data_hash": data_hash,
+    }
+
+
 def _generate_records(n=10000):
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     records = []
@@ -56,6 +77,7 @@ def _generate_records(n=10000):
 def startup():
     records = _generate_records()
     _build_indexes(records)
+    _compute_stats(records)  # Precompute stats at startup
 
 
 @app.get("/api/items")
@@ -86,25 +108,7 @@ def get_item(item_id: int):
 
 @app.get("/api/stats")
 def get_stats():
-    records = _load_records()
-
-    categories = {}
-    for r in records:
-        cat = r["category"]
-        if cat not in categories:
-            categories[cat] = {"count": 0, "total_value": 0}
-        categories[cat]["count"] += 1
-        categories[cat]["total_value"] += r["value"]
-
-    data_hash = hashlib.md5(json.dumps(records).encode()).hexdigest()
-
-    return JSONResponse(
-        content={
-            "categories": categories,
-            "total_records": len(records),
-            "data_hash": data_hash,
-        }
-    )
+    return JSONResponse(content=_stats_cache)
 
 
 @app.get("/health")
