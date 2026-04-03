@@ -9,6 +9,8 @@ app = FastAPI()
 
 DATA_FILE = Path(__file__).parent / "data" / "records.json"
 _records_cache = None
+_id_index = {}  # O(1) lookup by id
+_category_index = {}  # O(1) lookup by category
 
 
 def _load_records():
@@ -19,6 +21,18 @@ def _load_records():
         _records_cache = json.loads(DATA_FILE.read_text())
         return _records_cache
     return []
+
+
+def _build_indexes(records):
+    """Build lookup indexes for O(1) access."""
+    global _id_index, _category_index
+    _id_index = {r["id"]: r for r in records}
+    _category_index = {}
+    for r in records:
+        cat = r["category"]
+        if cat not in _category_index:
+            _category_index[cat] = []
+        _category_index[cat].append(r)
 
 
 def _generate_records(n=10000):
@@ -40,7 +54,8 @@ def _generate_records(n=10000):
 
 @app.on_event("startup")
 def startup():
-    _generate_records()
+    records = _generate_records()
+    _build_indexes(records)
 
 
 @app.get("/api/items")
@@ -49,10 +64,10 @@ def get_items(
     page: int = Query(default=1, ge=1),
     size: int = Query(default=100, ge=1, le=1000),
 ):
-    records = _load_records()
-
     if category:
-        records = [r for r in records if r["category"] == category]
+        records = _category_index.get(category, [])
+    else:
+        records = _load_records()
 
     start = (page - 1) * size
     end = start + size
@@ -69,11 +84,9 @@ def get_items(
 
 @app.get("/api/items/{item_id}")
 def get_item(item_id: int):
-    records = _load_records()
-    for r in records:
-        if r["id"] == item_id:
-            return JSONResponse(content=json.loads(json.dumps(r)))
-
+    r = _id_index.get(item_id)
+    if r:
+        return JSONResponse(content=json.loads(json.dumps(r)))
     return JSONResponse(content={"error": "not found"}, status_code=404)
 
 
