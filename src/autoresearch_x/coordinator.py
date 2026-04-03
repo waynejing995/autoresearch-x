@@ -381,6 +381,8 @@ def _run_worker(
             project_dir=str(proj),
             max_turns=max_turns,
             allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+            readonly=state.readonly,
+            scope=state.scope,
         )
     except Exception as e:
         logger.error(f"Worker SDK error: {e}")
