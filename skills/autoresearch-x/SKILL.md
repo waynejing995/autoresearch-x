@@ -29,12 +29,24 @@ Do NOT use for one-shot tasks, tasks without measurable criteria, or simple edit
 
 ## Invocation
 
+### Skill Mode (Single Session)
 - `/autoresearch-x` — interactive setup (guided questions)
 - `/autoresearch-x --template optimize|debug|investigate` — start from a template
 - `/autoresearch-x --program path/to/program.md` — use an existing program.md
 - `/autoresearch-x resume <tag>` — resume a previous run
 - `/autoresearch-x status` — show current run status
 - **Natural language** — if the user describes a task (e.g., "optimize the API latency", "debug why auth fails"), infer mode/target/scope from context, draft a program.md, and present it for review. No flags needed.
+
+### Agent Teams Mode (`--teams` flag via Coordinator CLI)
+- `uv run autoresearch-x --teams --program path/to/program.md` — start teams mode
+- `uv run autoresearch-x --teams --chat` — interactive program.md design then teams mode
+- `uv run autoresearch-x resume <tag>` — resume interrupted teams run
+- `uv run autoresearch-x status <tag>` — check teams run status
+- `uv run autoresearch-x cleanup` — remove old runs (default: 7 days)
+
+**When to use teams mode:** Complex tasks (30+ iterations) where context window pressure becomes a problem. Each iteration uses fresh teammates with clean context.
+
+**When to use skill mode:** Simple tasks (5-10 iterations) where a single session suffices.
 
 ## Three Modes (summary)
 
@@ -485,4 +497,67 @@ results.tsv:
 10:09  c3d  analyze  keep  a1b,b2c  H1:++  -  403 correlates with deploy (7/7)
 10:17  e5f  analyze  keep  c3d,d4e  H1:++  -  cert rotation is the mechanism
 10:24  g7h  conclude keep  c3d,e5f  -  -  root cause: deploy triggers cert rotation
+```
+
+---
+
+# Agent Teams Architecture (v3)
+
+## Overview
+
+Agent Teams mode uses Claude Code's teammate feature instead of subagents. Each iteration spawns fresh teammates with clean context, eliminating context window pressure for long runs (30+ iterations).
+
+## Key Differences from Skill Mode
+
+| | Skill Mode | Agent Teams Mode |
+|---|---|---|
+| **Context** | Single session accumulates history | Fresh teammates each iteration |
+| **Communication** | Subagent report back | Inbox/outbox JSON files + mailbox |
+| **Skills access** | Loaded by main agent | Auto-loaded by each teammate |
+| **Hooks** | Main session only | Each teammate loads hooks independently |
+| **Use case** | 5-10 iterations | 30+ iterations |
+
+## Architecture
+
+```
+Coordinator (Python CLI)
+├── State Manager     — state.json, results.tsv, branches.tsv
+├── Teammate Manager  — spawn/poll/shutdown via claude --teammate
+├── Branch Manager    — priority scoring, fork, stall detection
+└── Program Parser    — parse program.md
+
+Each iteration:
+  Coordinator → inbox/planner.json → Planner teammate → outbox/planner.json
+  Coordinator → inbox/worker.json  → Worker teammate  → outbox/worker.json
+  Coordinator → inbox/evaluator.json → Evaluator teammate → outbox/evaluator.json
+  Coordinator decides keep/discard, commits/reverts, records results
+```
+
+## Teammate Definitions
+
+Located in `.claude/agents/`:
+- `planner.md` — reads history, proposes ONE change
+- `worker.md` — executes code modifications (no eval access)
+- `evaluator.md` — runs eval commands (no code change access)
+- `strategist.md` — mind explosion when all branches stall
+
+## State Files
+
+```
+.autoresearch-x/<tag>/
+├── state.json           — RunState (current progress, budget, metrics)
+├── results.tsv          — iteration results
+├── all-results.tsv      — cross-branch consolidated results
+├── branches.tsv         — branch registry
+├── inbox/               — task files for teammates
+├── outbox/              — result files from teammates
+├── iterations/          — detailed iteration notes
+├── branches/
+│   ├── main/
+│   │   ├── results.tsv
+│   │   └── iterations/
+│   └── <fork-name>/
+│       ├── results.tsv
+│       └── iterations/
+└── report.md            — final report
 ```
