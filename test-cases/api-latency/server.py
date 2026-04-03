@@ -13,8 +13,11 @@ _records_cache = None
 
 def _load_records():
     global _records_cache
+    if _records_cache is not None:
+        return _records_cache
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text())
+        _records_cache = json.loads(DATA_FILE.read_text())
+        return _records_cache
     return []
 
 
