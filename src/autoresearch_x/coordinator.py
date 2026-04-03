@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import time
@@ -14,17 +15,9 @@ import click
 from loguru import logger
 
 from .branch_manager import BranchManager
-from .models import (
-    Decision,
-    EvaluatorResult,
-    PlannerResult,
-    ResultRow,
-    RunMode,
-    RunState,
-    WorkerResult,
-)
+from .models import Decision, ResultRow, RunMode, RunState
 from .program_parser import parse_program_md
-from .sdk_teammate import extract_json_from_result, run_teammate_sync
+from .sdk_teammate import run_teammate_sync
 from .state_manager import StateManager
 
 
@@ -41,17 +34,13 @@ def cli(verbose: bool) -> None:
 @click.option("--program", "-p", "program_path", required=True, help="Path to program.md")
 @click.option("--tag", "-t", default=None, help="Run tag (auto-generated if omitted)")
 @click.option("--project-dir", "-d", default=None, help="Project directory")
-@click.option("--chat", is_flag=True, help="Start with interactive chat to refine program.md")
-@click.option("--max-turns", default=20, help="Max turns per teammate")
-@click.option("--idle-timeout", default=300, help="Idle timeout in seconds")
+@click.option("--max-turns", default=25, help="Max turns per teammate")
 @click.option("--debug-dump", is_flag=True, help="Dump raw teammate output for debugging")
 def run(
     program_path: str,
     tag: Optional[str],
     project_dir: Optional[str],
-    chat: bool,
     max_turns: int,
-    idle_timeout: int,
     debug_dump: bool,
 ) -> None:
     """Start an Agent Teams iteration run."""
@@ -162,6 +151,71 @@ def cleanup(project_dir: Optional[str], days: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompts — plain text, no JSON required
+# ---------------------------------------------------------------------------
+
+_PLANNER_PROMPT = """\
+You are the Planner in an autoresearch-x iteration loop.
+
+## Task
+Analyze the iteration history and propose ONE change to optimize the target metric.
+
+## Program
+{program_text}
+
+## Iteration History
+{history_text}
+
+## Instructions
+- Propose exactly ONE specific change
+- Explain your rationale
+- List the files you want to modify
+- Output your plan as plain text — no JSON required
+- Do NOT edit any files — just propose the plan
+"""
+
+_WORKER_PROMPT = """\
+You are the Worker in an autoresearch-x iteration loop.
+
+## Task
+Execute the planned change.
+
+## Plan
+{plan_text}
+
+## Scope
+Only modify: {scope}
+Readonly: {readonly}
+
+## Instructions
+- Implement the planned change
+- Only modify files within scope
+- Do NOT touch readonly files
+- Do NOT run evaluation commands
+- Output a summary of what you changed — plain text, no JSON required
+"""
+
+_EVALUATOR_PROMPT = """\
+You are the Evaluator in an autoresearch-x iteration loop.
+
+## Task
+Run the evaluation command and report the metric.
+
+## Evaluation
+- Command: {eval_command}
+- Metric: {metric_name}
+- Target: {target_expr}
+
+## Instructions
+- Run the eval command using Bash
+- Report the metric value you found
+- State whether the target was met
+- Output your results as plain text — no JSON required
+- Include the key output from the eval command
+"""
+
+
+# ---------------------------------------------------------------------------
 # Core iteration loop
 # ---------------------------------------------------------------------------
 
@@ -171,7 +225,7 @@ def _run_loop(
     state_mgr: StateManager,
     branch_mgr: BranchManager,
     proj: Path,
-    max_turns: int = 20,
+    max_turns: int = 25,
     debug_dump: bool = False,
 ) -> None:
     """Main iteration loop."""
@@ -199,10 +253,9 @@ def _run_loop(
                 _trigger_strategist(state, state_mgr, branch_mgr, proj, max_turns)
             continue
 
-        state_mgr.clear_outbox()
-
-        planner_result = _run_planner(state, state_mgr, proj, max_turns, debug_dump)
-        if planner_result is None:
+        # ── Planner ──────────────────────────────────────────────────
+        planner_text = _run_planner(state, state_mgr, proj, max_turns, debug_dump)
+        if planner_text is None:
             logger.error("Planner failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Planner retry limit reached ({MAX_AGENT_RETRIES}), aborting")
@@ -214,9 +267,14 @@ def _run_loop(
             continue
 
         state.crash_count = 0
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"PLANNER (iter {state.iteration_count + 1}):")
+        logger.info(f"{'=' * 60}")
+        logger.info(planner_text)
 
-        worker_result = _run_worker(state, state_mgr, planner_result, proj, max_turns, debug_dump)
-        if worker_result is None:
+        # ── Worker ───────────────────────────────────────────────────
+        worker_text = _run_worker(state, state_mgr, planner_text, proj, max_turns, debug_dump)
+        if worker_text is None:
             logger.error("Worker failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Worker retry limit reached ({MAX_AGENT_RETRIES}), aborting")
@@ -227,8 +285,17 @@ def _run_loop(
             state_mgr.save_state(state)
             continue
 
-        eval_result = _run_evaluator(state, state_mgr, proj, max_turns, debug_dump)
-        if eval_result is None:
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"WORKER (iter {state.iteration_count + 1}):")
+        logger.info(f"{'=' * 60}")
+        logger.info(worker_text)
+
+        # ── Git commit (before eval, so eval tests the committed code) ─
+        commit = _git_commit_all(proj, state.iteration_count + 1)
+
+        # ── Evaluator ────────────────────────────────────────────────
+        eval_text = _run_evaluator(state, state_mgr, proj, max_turns, debug_dump)
+        if eval_text is None:
             logger.error("Evaluator failed")
             if state.crash_count >= MAX_AGENT_RETRIES - 1:
                 logger.error(f"Evaluator retry limit reached ({MAX_AGENT_RETRIES}), aborting")
@@ -239,19 +306,43 @@ def _run_loop(
             state_mgr.save_state(state)
             continue
 
-        commit = _git_commit_or_revert(state, worker_result, proj)
-        decision = _decide(state, eval_result)
-        _record(
-            state, state_mgr, commit, decision, eval_result, planner_result, next_branch.branch_id
-        )
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"EVALUATOR (iter {state.iteration_count + 1}):")
+        logger.info(f"{'=' * 60}")
+        logger.info(eval_text)
 
+        # ── Parse metric from eval text ──────────────────────────────
+        metric_value = _extract_metric(eval_text, state.metric_name)
+        target_met = state.is_target_met(metric_value)
+
+        # ── Decide ───────────────────────────────────────────────────
+        decision = _decide(state, metric_value)
+
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"DECISION (iter {state.iteration_count + 1}):")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Commit: {commit}")
+        logger.info(f"Metric: {metric_value} (target: {state.target_expr})")
+        logger.info(f"Target met: {target_met}")
+        logger.info(f"Decision: {decision.value}")
+
+        # ── Act on decision ──────────────────────────────────────────
+        if decision == Decision.DISCARD:
+            logger.info(f"Reverting changes from commit {commit}")
+            _git_revert(proj, commit)
+
+        # ── Record ───────────────────────────────────────────────────
+        desc = _extract_change_description(planner_text)
+        _record(state, state_mgr, commit, decision, metric_value, desc, next_branch.branch_id)
+
+        # ── Update state ─────────────────────────────────────────────
         if decision == Decision.KEEP:
             state.consecutive_discards = 0
-            if eval_result.metric_value is not None:
+            if metric_value is not None:
                 if state.best_metric is None or _is_better(
-                    eval_result.metric_value, state.best_metric, state.target_expr
+                    metric_value, state.best_metric, state.target_expr
                 ):
-                    state.best_metric = eval_result.metric_value
+                    state.best_metric = metric_value
                     state.best_commit = commit
         else:
             state.consecutive_discards += 1
@@ -259,7 +350,8 @@ def _run_loop(
                 branch_mgr.mark_stalled(next_branch.branch_id)
 
         state.iteration_count += 1
-        if eval_result.target_met:
+
+        if target_met:
             logger.info("Target met! Writing final report...")
             state.status = "completed"
             state_mgr.save_state(state)
@@ -278,31 +370,13 @@ def _run_planner(
     proj: Path,
     max_turns: int,
     debug_dump: bool,
-) -> Optional[PlannerResult]:
+) -> Optional[str]:
     program_text = Path(state.program_md_path).read_text() if state.program_md_path else ""
-    outbox_path = state_mgr.outbox_dir / "planner.json"
-    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
+    history_text = _build_history_text(state_mgr)
 
-    prompt = (
-        f"You are the Planner in an autoresearch-x iteration loop.\n\n"
-        f"## Task\n"
-        f"Analyze the iteration history and propose ONE change to reduce latency.\n\n"
-        f"## Context\n"
-        f"- State: {state_mgr.state_path}\n"
-        f"- Results: {state_mgr.results_path}\n"
-        f"- Iterations dir: {state_mgr.iterations_dir}\n\n"
-        f"## Program\n"
-        f"{program_text}\n\n"
-        f"## CRITICAL OUTPUT REQUIREMENT\n"
-        f"You MUST write a JSON file to: {outbox_path}\n"
-        f"Use the Write tool to create this file with the following JSON:\n"
-        f'{{"status": "success", "plan": {{\n'
-        f'  "change_description": "one sentence description",\n'
-        f'  "rationale": "why this works",\n'
-        f'  "expected_signal": "what metric change to expect",\n'
-        f'  "files_to_modify": ["path/to/file.py"]\n'
-        f"}}}}\n"
-        f"Do NOT just describe the analysis in text. You MUST write the JSON file."
+    prompt = _PLANNER_PROMPT.format(
+        program_text=program_text,
+        history_text=history_text,
     )
 
     try:
@@ -310,7 +384,17 @@ def _run_planner(
             prompt=prompt,
             project_dir=str(proj),
             max_turns=max_turns,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Bash",
+                "Grep",
+                "Glob",
+                "LS",
+                "WebFetch",
+                "WebSearch",
+            ],
         )
     except Exception as e:
         logger.error(f"Planner SDK error: {e}")
@@ -319,60 +403,22 @@ def _run_planner(
     if debug_dump:
         dump_file = state_mgr.run_dir / f"planner-iter-{state.iteration_count + 1}-raw.json"
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
-        logger.info(f"Dumped planner raw messages to {dump_file}")
 
-    # Primary: read the outbox file the agent wrote
-    outbox_text = state_mgr.read_outbox("planner") or ""
-    if outbox_text:
-        try:
-            data = json.loads(outbox_text)
-            return PlannerResult(**data)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.debug(f"Outbox JSON parse error: {e}")
-
-    # Fallback: extract from agent's text response
-    data = extract_json_from_result(result)
-    if data is None:
-        logger.error(
-            f"Planner produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
-        )
-        return None
-
-    try:
-        return PlannerResult(**data)
-    except Exception as e:
-        logger.error(f"Failed to parse planner result: {e}")
-        return None
+    return result.get_full_text() or None
 
 
 def _run_worker(
     state: RunState,
     state_mgr: StateManager,
-    plan: PlannerResult,
+    plan_text: str,
     proj: Path,
     max_turns: int,
     debug_dump: bool,
-) -> Optional[WorkerResult]:
-    plan_data = plan.plan or {}
-    outbox_path = state_mgr.outbox_dir / "worker.json"
-    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
-
-    prompt = (
-        f"You are the Worker in an autoresearch-x iteration loop.\n\n"
-        f"## Task\n"
-        f"Execute the planned change.\n\n"
-        f"## Plan\n"
-        f"{json.dumps(plan_data, indent=2)}\n\n"
-        f"## Scope\n"
-        f"Only modify: {', '.join(state.scope) if state.scope else 'any file'}\n"
-        f"Readonly: {', '.join(state.readonly) if state.readonly else 'none'}\n\n"
-        f"## CRITICAL OUTPUT REQUIREMENT\n"
-        f"After making changes, you MUST write a JSON file to: {outbox_path}\n"
-        f"Use the Write tool to create this file with:\n"
-        f'{{"status": "success", "files_modified": ["path.py"],\n'
-        f'  "changes_summary": "what you changed",\n'
-        f'  "observations": "anything notable"}}\n'
-        f"Do NOT just describe changes in text. You MUST write the JSON file."
+) -> Optional[str]:
+    prompt = _WORKER_PROMPT.format(
+        plan_text=plan_text,
+        scope=", ".join(state.scope) if state.scope else "any file",
+        readonly=", ".join(state.readonly) if state.readonly else "none",
     )
 
     try:
@@ -380,7 +426,17 @@ def _run_worker(
             prompt=prompt,
             project_dir=str(proj),
             max_turns=max_turns,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Bash",
+                "Grep",
+                "Glob",
+                "LS",
+                "WebFetch",
+                "WebSearch",
+            ],
             readonly=state.readonly,
             scope=state.scope,
         )
@@ -391,30 +447,8 @@ def _run_worker(
     if debug_dump:
         dump_file = state_mgr.run_dir / f"worker-iter-{state.iteration_count + 1}-raw.json"
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
-        logger.info(f"Dumped worker raw messages to {dump_file}")
 
-    # Primary: read the outbox file
-    outbox_text = state_mgr.read_outbox("worker") or ""
-    if outbox_text:
-        try:
-            data = json.loads(outbox_text)
-            return WorkerResult(**data)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.debug(f"Worker outbox JSON parse error: {e}")
-
-    # Fallback: extract from agent's text response
-    data = extract_json_from_result(result)
-    if data is None:
-        logger.error(
-            f"Worker produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
-        )
-        return None
-
-    try:
-        return WorkerResult(**data)
-    except Exception as e:
-        logger.error(f"Failed to parse worker result: {e}")
-        return None
+    return result.get_full_text() or None
 
 
 def _run_evaluator(
@@ -423,29 +457,11 @@ def _run_evaluator(
     proj: Path,
     max_turns: int,
     debug_dump: bool,
-) -> Optional[EvaluatorResult]:
-    outbox_path = state_mgr.outbox_dir / "evaluator.json"
-    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
-
-    prompt = (
-        f"You are the Evaluator in an autoresearch-x iteration loop.\n\n"
-        f"## Task\n"
-        f"Run the evaluation command and extract the metric.\n\n"
-        f"## Evaluation\n"
-        f"- Command: {state.eval_command}\n"
-        f"- Metric: {state.metric_name}\n"
-        f"- Target: {state.target_expr}\n\n"
-        f"## Steps\n"
-        f"1. Run the eval command using Bash\n"
-        f"2. Parse the output to find the metric value\n"
-        f"3. Write the result JSON file\n\n"
-        f"## CRITICAL OUTPUT REQUIREMENT\n"
-        f"You MUST write a JSON file to: {outbox_path}\n"
-        f"Use the Write tool to create this file with:\n"
-        f'{{"status": "success", "exit_code": 0, "metric_value": 123.4,\n'
-        f'  "target_met": false, "extraction_method": "grep",\n'
-        f'  "peak_output": "first 200 chars of output"}}\n'
-        f"Do NOT just describe results in text. You MUST write the JSON file."
+) -> Optional[str]:
+    prompt = _EVALUATOR_PROMPT.format(
+        eval_command=state.eval_command,
+        metric_name=state.metric_name,
+        target_expr=state.target_expr,
     )
 
     try:
@@ -453,7 +469,17 @@ def _run_evaluator(
             prompt=prompt,
             project_dir=str(proj),
             max_turns=max_turns,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Bash",
+                "Grep",
+                "Glob",
+                "LS",
+                "WebFetch",
+                "WebSearch",
+            ],
         )
     except Exception as e:
         logger.error(f"Evaluator SDK error: {e}")
@@ -462,49 +488,31 @@ def _run_evaluator(
     if debug_dump:
         dump_file = state_mgr.run_dir / f"evaluator-iter-{state.iteration_count + 1}-raw.json"
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
-        logger.info(f"Dumped evaluator raw messages to {dump_file}")
 
-    # Primary: read the outbox file
-    outbox_text = state_mgr.read_outbox("evaluator") or ""
-    if outbox_text:
-        try:
-            data = json.loads(outbox_text)
-            return EvaluatorResult(**data)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.debug(f"Evaluator outbox JSON parse error: {e}")
+    return result.get_full_text() or None
 
-    # Fallback: extract from agent's text response
-    data = extract_json_from_result(result)
-    if data is None:
-        logger.error(
-            f"Evaluator produced no parseable JSON. Full text: {result.get_full_text()[:500]}"
+
+# ---------------------------------------------------------------------------
+# Git operations
+# ---------------------------------------------------------------------------
+
+
+def _git_commit_all(proj: Path, iteration: int) -> str:
+    """Commit all changes. Returns commit hash or 'no-change'."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=proj,
+            capture_output=True,
+            text=True,
+            check=True,
         )
-        return None
+        if not status.stdout.strip():
+            return "no-change"
 
-    try:
-        return EvaluatorResult(**data)
-    except Exception as e:
-        logger.error(f"Failed to parse evaluator result: {e}")
-        return None
-
-
-def _git_commit_or_revert(
-    state: RunState,
-    worker_result: WorkerResult,
-    proj: Path,
-) -> str:
-    files = worker_result.files_modified or []
-    if not files:
-        return "no-change"
-    try:
-        subprocess.run(["git", "add"] + files, cwd=proj, capture_output=True, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=proj, capture_output=True, check=True)
         subprocess.run(
-            [
-                "git",
-                "commit",
-                "-m",
-                f"iter {state.iteration_count + 1}: {worker_result.changes_summary}",
-            ],
+            ["git", "commit", "-m", f"iter {iteration}"],
             cwd=proj,
             capture_output=True,
             text=True,
@@ -523,19 +531,110 @@ def _git_commit_or_revert(
         return "commit-failed"
 
 
-def _decide(state: RunState, eval_result: EvaluatorResult) -> Decision:
-    if eval_result.status != "success" or eval_result.metric_value is None:
+def _git_revert(proj: Path, commit: str) -> None:
+    """Revert a specific commit's changes."""
+    if commit in ("no-change", "commit-failed"):
+        return
+    try:
+        subprocess.run(
+            ["git", "revert", "--no-edit", commit],
+            cwd=proj,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        # Fallback: reset to previous commit
+        try:
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD~1"],
+                cwd=proj,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Git revert failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Metric extraction from plain text
+# ---------------------------------------------------------------------------
+
+
+def _extract_metric(text: str, metric_name: str) -> Optional[float]:
+    """Extract metric value from evaluator's plain text output."""
+    if not text or not metric_name:
+        return None
+
+    # Try: "metric_name: 123.45" or "metric_name = 123.45"
+    patterns = [
+        rf'{re.escape(metric_name)}["\s]*[:=]\s*([\d.]+)',
+        rf"([\d.]+)\s*(?:ms|milliseconds)\s*(?:{re.escape(metric_name)})?",
+        rf'(?:p99|pipeline_total)["\s]*[:=]\s*([\d.]+)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+
+    # Try: any standalone number near "p99" or "total"
+    m = re.search(r'(?:p99|total)["\s]*[:=]\s*([\d.]+)', text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+
+    return None
+
+
+def _extract_change_description(planner_text: str) -> str:
+    """Extract a one-line description from planner output."""
+    if not planner_text:
+        return ""
+    # Use first non-empty line as description
+    for line in planner_text.strip().split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#") and not line.startswith("-"):
+            return line[:200]
+    return planner_text.strip()[:200]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_history_text(state_mgr: StateManager) -> str:
+    """Build iteration history text for the planner."""
+    rows = state_mgr.read_all_results()
+    if not rows:
+        return "No previous iterations — this is the baseline."
+
+    lines = []
+    for r in rows[-5:]:  # Last 5 iterations
+        lines.append(
+            f"- iter: commit={r.commit} decision={r.decision} "
+            f"metric={r.metric_value} desc={r.description}"
+        )
+    return "\n".join(lines)
+
+
+def _decide(state: RunState, metric_value: Optional[float]) -> Decision:
+    if metric_value is None:
         return Decision.DISCARD
     if state.best_metric is None:
-        return Decision.KEEP
-    if _is_better(eval_result.metric_value, state.best_metric, state.target_expr):
+        return Decision.KEEP  # baseline always keeps
+    if _is_better(metric_value, state.best_metric, state.target_expr):
         return Decision.KEEP
     return Decision.DISCARD
 
 
 def _is_better(new_val: float, old_val: float, target_expr: str) -> bool:
-    import re
-
     m = re.search(r"([<>=!]+)", target_expr)
     if m:
         op = m.group(1)
@@ -551,15 +650,13 @@ def _record(
     state_mgr: StateManager,
     commit: str,
     decision: Decision,
-    eval_result: EvaluatorResult,
-    plan_result: PlannerResult,
+    metric_value: Optional[float],
+    description: str,
     branch_id: str,
 ) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
-    plan_data = plan_result.plan or {} if plan_result else {}
-    desc = plan_data.get("change_description", "") if plan_data else ""
     phase = "baseline" if state.iteration_count == 0 else "iterate"
-    metric_str = str(eval_result.metric_value) if eval_result.metric_value is not None else "-"
+    metric_str = str(metric_value) if metric_value is not None else "-"
 
     row = ResultRow(
         timestamp=ts,
@@ -567,7 +664,7 @@ def _record(
         phase=phase,
         decision=decision.value,
         metric_value=metric_str,
-        description=desc,
+        description=description,
     )
     state_mgr.append_result(row, branch_id)
 
@@ -575,7 +672,7 @@ def _record(
     detail += f"- **Commit:** {commit}\n"
     detail += f"- **Decision:** {decision.value}\n"
     detail += f"- **Metric:** {metric_str}\n"
-    detail += f"- **Description:** {desc}\n"
+    detail += f"- **Description:** {description}\n"
     state_mgr.write_iteration_detail(commit, detail, branch_id)
 
 
@@ -602,7 +699,17 @@ def _trigger_strategist(
             prompt=prompt,
             project_dir=str(proj),
             max_turns=max_turns,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"],
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Bash",
+                "Grep",
+                "Glob",
+                "LS",
+                "WebFetch",
+                "WebSearch",
+            ],
         )
         logger.info(f"Strategist analysis: {result.get_full_text()[:500]}")
     except Exception as e:

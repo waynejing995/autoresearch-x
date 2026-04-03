@@ -150,7 +150,7 @@ async def run_teammate(
         cwd=project_dir,
         max_turns=max_turns,
         allowed_tools=tools,
-        permission_mode="acceptEdits",
+        permission_mode="bypassPermissions",
         system_prompt=system_prompt,
         hooks=hooks,
     )
