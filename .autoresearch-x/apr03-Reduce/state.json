@@ -1,0 +1,29 @@
+{
+  "tag": "apr03-Reduce",
+  "mode": "optimize",
+  "target": "Reduce overall p99 API latency below 50ms",
+  "current_branch": "main",
+  "iteration_count": 4,
+  "max_iterations": 20,
+  "best_metric": 68.92,
+  "best_commit": "22a97c1",
+  "consecutive_discards": 3,
+  "crash_count": 0,
+  "mind_explosions": 0,
+  "active_branches": [
+    "main"
+  ],
+  "started_at": "2026-04-03T03:45:02.493189+00:00",
+  "timeout_minutes": 30,
+  "program_md_path": "test-cases/api-latency/program.md",
+  "eval_command": "uv run python test-cases/api-latency/bench.py --json",
+  "metric_name": "p99_latency_ms",
+  "target_expr": "< 50",
+  "scope": [
+    "test-cases/api-latency/server.py"
+  ],
+  "readonly": [
+    "test-cases/api-latency/bench.py"
+  ],
+  "status": "running"
+}

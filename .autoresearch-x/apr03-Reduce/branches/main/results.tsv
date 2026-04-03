@@ -1,0 +1,5 @@
+timestamp	commit	phase	decision	prev_commits	hypotheses	metric_value	description
+2026-04-03T03:47	22a97c1	baseline	keep	-	-	68.92	Remove all time.sleep() calls that add artificial delays (50ms, 20ms, 30ms) to API endpoints
+2026-04-03T03:49	e7de93d	iterate	discard	-	-	69.72	Fix the _load_records() function to actually use _records_cache, eliminating disk I/O on every request
+2026-04-03T03:51	8bde97c	iterate	discard	-	-	69.41	Build lookup indexes at startup: id_to_record dict for O(1) item lookups and category_to_records dict for O(1) category filtering
+2026-04-03T03:53	f02a67e	iterate	discard	-	-	69.64	Remove inefficient string concatenation in /api/items endpoint and eliminate double json serialization in get_item endpoint
