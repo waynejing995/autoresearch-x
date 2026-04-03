@@ -166,12 +166,22 @@ Analyze the iteration history and propose ONE change to optimize the target metr
 ## Iteration History
 {history_text}
 
-## Instructions
-- Propose exactly ONE specific change
-- Explain your rationale
-- List the files you want to modify
-- Output your plan as plain text — no JSON required
-- Do NOT edit any files — just propose the plan
+## Allowed Actions
+- Read source files to understand current state
+- Read iteration history and results.tsv for patterns
+- Write to program.md to update lessons learned and tips (e.g., "Lesson: GPU test suite requires sudo for device access")
+
+## Forbidden Actions
+- Do NOT modify any source code files
+- Do NOT run evaluation or build commands
+- Do NOT modify state.json, results.tsv, or branches.tsv
+
+## Output Format
+Propose your plan as plain text with these sections:
+1. **Change**: One specific, actionable change description
+2. **Rationale**: Why this change should improve the metric, referencing prior iteration evidence
+3. **Files**: List of files the Worker should modify
+4. **Lesson** (optional): New insight to append to program.md
 """
 
 _WORKER_PROMPT = """\
@@ -187,12 +197,21 @@ Execute the planned change.
 Only modify: {scope}
 Readonly: {readonly}
 
-## Instructions
-- Implement the planned change
-- Only modify files within scope
-- Do NOT touch readonly files
-- Do NOT run evaluation commands
-- Output a summary of what you changed — plain text, no JSON required
+## Allowed Actions
+- Read any file to understand context
+- Edit/Write files within scope only
+- Run diagnostic Bash commands (e.g., grep, git diff) — no builds
+
+## Forbidden Actions
+- Do NOT modify files outside scope or marked as readonly
+- Do NOT run evaluation commands (the Evaluator does that)
+- Do NOT modify program.md, state.json, results.tsv, or branches.tsv
+
+## Output Format
+After implementing, output a plain text summary with:
+1. **Files Modified**: List of files changed
+2. **Changes**: Brief description of each change
+3. **Observations**: Any unexpected behavior or risks noticed during implementation
 """
 
 _EVALUATOR_PROMPT = """\
@@ -206,12 +225,22 @@ Run the evaluation command and report the metric.
 - Metric: {metric_name}
 - Target: {target_expr}
 
-## Instructions
+## Allowed Actions
 - Run the eval command using Bash
-- Report the metric value you found
-- State whether the target was met
-- Output your results as plain text — no JSON required
-- Include the key output from the eval command
+- Write eval logs to .autoresearch-x/<tag>/eval-logs/iter_{iteration}.log
+- Read source files to interpret eval output
+
+## Forbidden Actions
+- Do NOT modify source code files
+- Do NOT modify program.md, state.json, results.tsv, or branches.tsv
+
+## Output Format
+Output a plain text report with:
+1. **Exit Code**: Command exit code
+2. **Metric Value**: The extracted metric number
+3. **Target Met**: Yes/No (based on target expression)
+4. **Key Excerpt**: Relevant lines from eval output (max 20 lines)
+5. **Observations**: Anomalies, warnings, or notes about the eval run
 """
 
 
@@ -379,6 +408,9 @@ def _run_planner(
         history_text=history_text,
     )
 
+    # Planner: readonly everything except program.md (if set)
+    planner_scope = [state.program_md_path] if state.program_md_path else []
+
     try:
         result = run_teammate_sync(
             prompt=prompt,
@@ -395,6 +427,7 @@ def _run_planner(
                 "WebFetch",
                 "WebSearch",
             ],
+            scope=planner_scope,
         )
     except Exception as e:
         logger.error(f"Planner SDK error: {e}")
@@ -464,6 +497,10 @@ def _run_evaluator(
         target_expr=state.target_expr,
     )
 
+    # Evaluator: can only write to eval-logs directory
+    eval_logs_dir = f".autoresearch-x/{state.tag}/eval-logs/"
+    evaluator_scope = [eval_logs_dir]
+
     try:
         result = run_teammate_sync(
             prompt=prompt,
@@ -480,6 +517,7 @@ def _run_evaluator(
                 "WebFetch",
                 "WebSearch",
             ],
+            scope=evaluator_scope,
         )
     except Exception as e:
         logger.error(f"Evaluator SDK error: {e}")

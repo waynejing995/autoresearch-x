@@ -98,7 +98,10 @@ def _build_scope_hook(
         return {}
 
     return {
-        "PreToolUse": [HookMatcher(matcher="Write", hooks=[_scope_guard])],
+        "PreToolUse": [
+            HookMatcher(matcher="Write", hooks=[_scope_guard]),
+            HookMatcher(matcher="Edit", hooks=[_scope_guard]),
+        ],
     }
 
 
