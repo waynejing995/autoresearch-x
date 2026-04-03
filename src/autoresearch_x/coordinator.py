@@ -22,10 +22,9 @@ from .models import (
     RunMode,
     RunState,
     WorkerResult,
-    extract_json_from_result,
 )
 from .program_parser import parse_program_md
-from .sdk_teammate import TeammateResult, extract_json_from_result, run_teammate_sync
+from .sdk_teammate import extract_json_from_result, run_teammate_sync
 from .state_manager import StateManager
 
 
@@ -281,6 +280,9 @@ def _run_planner(
     debug_dump: bool,
 ) -> Optional[PlannerResult]:
     program_text = Path(state.program_md_path).read_text() if state.program_md_path else ""
+    outbox_path = state_mgr.outbox_dir / "planner.json"
+    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
+
     prompt = (
         f"You are the Planner in an autoresearch-x iteration loop.\n\n"
         f"## Task\n"
@@ -291,11 +293,16 @@ def _run_planner(
         f"- Iterations dir: {state_mgr.iterations_dir}\n\n"
         f"## Program\n"
         f"{program_text}\n\n"
-        f"## Output\n"
-        f"Write your result as a JSON object to {state_mgr.outbox_dir / 'planner.json'}:\n"
-        f"```json\n"
-        f'{{"status": "success", "plan": {{"change_description": "...", "rationale": "...", "expected_signal": "...", "files_to_modify": [...]}}}}\n'
-        f"```"
+        f"## CRITICAL OUTPUT REQUIREMENT\n"
+        f"You MUST write a JSON file to: {outbox_path}\n"
+        f"Use the Write tool to create this file with the following JSON:\n"
+        f'{{"status": "success", "plan": {{\n'
+        f'  "change_description": "one sentence description",\n'
+        f'  "rationale": "why this works",\n'
+        f'  "expected_signal": "what metric change to expect",\n'
+        f'  "files_to_modify": ["path/to/file.py"]\n'
+        f"}}}}\n"
+        f"Do NOT just describe the analysis in text. You MUST write the JSON file."
     )
 
     try:
@@ -314,6 +321,16 @@ def _run_planner(
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
         logger.info(f"Dumped planner raw messages to {dump_file}")
 
+    # Primary: read the outbox file the agent wrote
+    outbox_text = state_mgr.read_outbox("planner") or ""
+    if outbox_text:
+        try:
+            data = json.loads(outbox_text)
+            return PlannerResult(**data)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(f"Outbox JSON parse error: {e}")
+
+    # Fallback: extract from agent's text response
     data = extract_json_from_result(result)
     if data is None:
         logger.error(
@@ -337,6 +354,9 @@ def _run_worker(
     debug_dump: bool,
 ) -> Optional[WorkerResult]:
     plan_data = plan.plan or {}
+    outbox_path = state_mgr.outbox_dir / "worker.json"
+    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
+
     prompt = (
         f"You are the Worker in an autoresearch-x iteration loop.\n\n"
         f"## Task\n"
@@ -346,11 +366,13 @@ def _run_worker(
         f"## Scope\n"
         f"Only modify: {', '.join(state.scope) if state.scope else 'any file'}\n"
         f"Readonly: {', '.join(state.readonly) if state.readonly else 'none'}\n\n"
-        f"## Output\n"
-        f"Write your result as a JSON object to {state_mgr.outbox_dir / 'worker.json'}:\n"
-        f"```json\n"
-        f'{{"status": "success", "files_modified": [...], "changes_summary": "...", "observations": "..."}}\n'
-        f"```"
+        f"## CRITICAL OUTPUT REQUIREMENT\n"
+        f"After making changes, you MUST write a JSON file to: {outbox_path}\n"
+        f"Use the Write tool to create this file with:\n"
+        f'{{"status": "success", "files_modified": ["path.py"],\n'
+        f'  "changes_summary": "what you changed",\n'
+        f'  "observations": "anything notable"}}\n'
+        f"Do NOT just describe changes in text. You MUST write the JSON file."
     )
 
     try:
@@ -369,6 +391,16 @@ def _run_worker(
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
         logger.info(f"Dumped worker raw messages to {dump_file}")
 
+    # Primary: read the outbox file
+    outbox_text = state_mgr.read_outbox("worker") or ""
+    if outbox_text:
+        try:
+            data = json.loads(outbox_text)
+            return WorkerResult(**data)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(f"Worker outbox JSON parse error: {e}")
+
+    # Fallback: extract from agent's text response
     data = extract_json_from_result(result)
     if data is None:
         logger.error(
@@ -390,6 +422,9 @@ def _run_evaluator(
     max_turns: int,
     debug_dump: bool,
 ) -> Optional[EvaluatorResult]:
+    outbox_path = state_mgr.outbox_dir / "evaluator.json"
+    state_mgr.outbox_dir.mkdir(parents=True, exist_ok=True)
+
     prompt = (
         f"You are the Evaluator in an autoresearch-x iteration loop.\n\n"
         f"## Task\n"
@@ -398,12 +433,17 @@ def _run_evaluator(
         f"- Command: {state.eval_command}\n"
         f"- Metric: {state.metric_name}\n"
         f"- Target: {state.target_expr}\n\n"
-        f"## Output\n"
-        f"Run the command, extract the metric, and write your result as JSON to "
-        f"{state_mgr.outbox_dir / 'evaluator.json'}:\n"
-        f"```json\n"
-        f'{{"status": "success", "exit_code": 0, "metric_value": 123.4, "target_met": false, "extraction_method": "grep", "peak_output": "..."}}\n'
-        f"```"
+        f"## Steps\n"
+        f"1. Run the eval command using Bash\n"
+        f"2. Parse the output to find the metric value\n"
+        f"3. Write the result JSON file\n\n"
+        f"## CRITICAL OUTPUT REQUIREMENT\n"
+        f"You MUST write a JSON file to: {outbox_path}\n"
+        f"Use the Write tool to create this file with:\n"
+        f'{{"status": "success", "exit_code": 0, "metric_value": 123.4,\n'
+        f'  "target_met": false, "extraction_method": "grep",\n'
+        f'  "peak_output": "first 200 chars of output"}}\n'
+        f"Do NOT just describe results in text. You MUST write the JSON file."
     )
 
     try:
@@ -422,6 +462,16 @@ def _run_evaluator(
         dump_file.write_text(json.dumps(result.raw_messages, indent=2, default=str))
         logger.info(f"Dumped evaluator raw messages to {dump_file}")
 
+    # Primary: read the outbox file
+    outbox_text = state_mgr.read_outbox("evaluator") or ""
+    if outbox_text:
+        try:
+            data = json.loads(outbox_text)
+            return EvaluatorResult(**data)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(f"Evaluator outbox JSON parse error: {e}")
+
+    # Fallback: extract from agent's text response
     data = extract_json_from_result(result)
     if data is None:
         logger.error(
@@ -538,11 +588,11 @@ def _trigger_strategist(
         f"You are the Strategist. All branches are stalled.\n\n"
         f"Analyze all branch failures and propose new strategies.\n\n"
         f"## Results\n"
-        f"{state_mgr.all_results_path.read_text() if state_mgr.all_results_path.exists() else 'No results'}\n\n"
+        f"{_read_or_default(state_mgr.all_results_path, 'No results')}\n\n"
         f"## Program\n"
-        f"{Path(state.program_md_path).read_text() if state.program_md_path else ''}\n\n"
+        f"{_read_or_default(_path_or_none(state.program_md_path), '')}\n\n"
         f"## Branches\n"
-        f"{state_mgr.branches_path.read_text() if state_mgr.branches_path.exists() else 'No branches'}"
+        f"{_read_or_default(state_mgr.branches_path, 'No branches')}"
     )
 
     try:
@@ -575,20 +625,20 @@ def _write_final_report(
     lines = [
         f"# Final Report: {state.tag}",
         "",
-        f"## Outcome",
+        "## Outcome",
         f"- **Target:** {state.target}",
         f"- **Status:** {state.status}",
         f"- **Best metric:** {state.best_metric}",
         f"- **Best commit:** {state.best_commit}",
         "",
-        f"## Statistics",
+        "## Statistics",
         f"- **Total iterations:** {state.iteration_count}",
         f"- **Keeps:** {keeps}",
         f"- **Discards:** {discards}",
         f"- **Crashes:** {state.crash_count}",
         f"- **Mind explosions:** {state.mind_explosions}",
         "",
-        f"## Branch Summary",
+        "## Branch Summary",
     ]
     for b in branches:
         lines.append(
@@ -596,7 +646,7 @@ def _write_final_report(
         )
 
     lines.append("")
-    lines.append(f"## Timeline")
+    lines.append("## Timeline")
     lines.append(f"- **Started:** {state.started_at}")
     lines.append(f"- **Ended:** {datetime.now(timezone.utc).isoformat()}")
 
@@ -604,8 +654,18 @@ def _write_final_report(
     logger.info(f"Final report written to {report}")
 
 
+def _path_or_none(s: str) -> Optional[Path]:
+    return Path(s) if s else None
+
+
 def _generate_tag(mode: str, target: str) -> str:
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%b%d").lower()
     topic = target.split()[0] if target else mode
     return f"{date_str}-{topic}"
+
+
+def _read_or_default(path: Optional[Path], default: str) -> str:
+    if path and path.exists():
+        return path.read_text()
+    return default

@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-from pathlib import Path
 from typing import Any, Optional
 
+import anyio
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    AssistantMessage,
     ResultMessage,
     TextBlock,
-    ToolUseBlock,
     ToolResultBlock,
+    ToolUseBlock,
 )
-from loguru import logger
-
-from .models import TeammateRole
 
 
 class TeammateResult:
@@ -142,3 +138,21 @@ def extract_json_from_result(result: TeammateResult) -> Optional[dict]:
         return {"status": status_match.group(1), "raw_text": full_text[:500]}
 
     return None
+
+
+def run_teammate_sync(
+    prompt: str,
+    project_dir: str,
+    max_turns: int = 20,
+    allowed_tools: Optional[list[str]] = None,
+    system_prompt: Optional[str] = None,
+) -> TeammateResult:
+    """Synchronous wrapper for run_teammate."""
+    return anyio.run(
+        run_teammate,
+        prompt,
+        project_dir,
+        max_turns,
+        allowed_tools,
+        system_prompt,
+    )

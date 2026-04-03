@@ -1,25 +1,15 @@
-"""Integration test: full coordinator loop with mocked teammates.
-
-Simulates a real performance tuning run by:
-1. Creating a real StateManager with run directory
-2. Mocking teammate spawn/wait/output to return controlled results
-3. Running the coordinator loop for several iterations
-4. Verifying results.tsv, state.json, and keep/discard logic
-"""
+"""Integration test: full coordinator loop with mocked SDK teammates."""
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from autoresearch_x.branch_manager import BranchManager
-from autoresearch_x.models import (
-    RunMode,
-    TeammateStatus,
-)
+from autoresearch_x.models import RunMode
+from autoresearch_x.sdk_teammate import TeammateResult
 from autoresearch_x.state_manager import StateManager
-from autoresearch_x.teammate_manager import TeammateManager
 
 
 @pytest.fixture
@@ -46,31 +36,15 @@ def run_setup(tmp_path: Path):
     return proj, mgr, state
 
 
-def _mock_teammate_output(outbox_dir: Path, role: str, data: dict):
-    import json
-
-    outbox_dir.mkdir(exist_ok=True)
-    (outbox_dir / f"{role}.json").write_text(f"```json\n{json.dumps(data)}\n```")
-
-
-def _make_mock_tm(state_mgr: StateManager):
-    tm = MagicMock(spec=TeammateManager)
-    tm.spawn.return_value = "mock-agent"
-    tm.wait_for_idle.return_value = TeammateStatus.IDLE
-    tm.get_output.return_value = ("", "")
-    return tm
+def _make_sdk_result(json_data: dict, text: str = "") -> TeammateResult:
+    result = TeammateResult()
+    result.add_text(text)
+    result.add_text(f"```json\n{json.dumps(json_data)}\n```")
+    return result
 
 
 def test_single_iteration_keep(run_setup):
     proj, state_mgr, state = run_setup
-
-    tm = _make_mock_tm(state_mgr)
-
-    metrics = [350.0, 280.0, 250.0]
-
-    def write_outbox(role: str, data: dict):
-        state_mgr.outbox_dir.mkdir(exist_ok=True)
-        (state_mgr.outbox_dir / f"{role}.json").write_text(f"```json\n{json.dumps(data)}\n```")
 
     from autoresearch_x.coordinator import (
         _decide,
@@ -82,48 +56,51 @@ def test_single_iteration_keep(run_setup):
     )
     from autoresearch_x.models import Decision
 
-    write_outbox(
-        "planner",
-        {
-            "status": "success",
-            "plan": {
-                "change_description": "Optimization attempt 1",
-                "files_to_modify": ["server.py"],
-            },
+    planner_data = {
+        "status": "success",
+        "plan": {
+            "change_description": "Optimization attempt 1",
+            "files_to_modify": ["server.py"],
         },
-    )
-    planner = _run_planner(state, state_mgr, tm, proj)
+    }
+    with patch(
+        "autoresearch_x.coordinator.run_teammate_sync",
+        return_value=_make_sdk_result(planner_data),
+    ):
+        planner = _run_planner(state, state_mgr, proj, max_turns=15, debug_dump=False)
     assert planner is not None
     assert planner.status == "success"
 
-    write_outbox(
-        "worker",
-        {
-            "status": "success",
-            "files_modified": ["server.py"],
-            "changes_summary": "Applied optimization 1",
-        },
-    )
-    worker = _run_worker(state, state_mgr, tm, planner, proj)
+    worker_data = {
+        "status": "success",
+        "files_modified": ["server.py"],
+        "changes_summary": "Applied optimization 1",
+    }
+    with patch(
+        "autoresearch_x.coordinator.run_teammate_sync",
+        return_value=_make_sdk_result(worker_data),
+    ):
+        worker = _run_worker(state, state_mgr, planner, proj, max_turns=15, debug_dump=False)
     assert worker is not None
     assert worker.status == "success"
 
-    write_outbox(
-        "evaluator",
-        {
-            "status": "success",
-            "exit_code": 0,
-            "metric_value": metrics[0],
-            "target_met": metrics[0] < 200,
-            "extraction_method": "grep",
-        },
-    )
-    evaluator = _run_evaluator(state, state_mgr, tm, proj)
+    eval_data = {
+        "status": "success",
+        "exit_code": 0,
+        "metric_value": 350.0,
+        "target_met": False,
+        "extraction_method": "grep",
+    }
+    with patch(
+        "autoresearch_x.coordinator.run_teammate_sync",
+        return_value=_make_sdk_result(eval_data),
+    ):
+        evaluator = _run_evaluator(state, state_mgr, proj, max_turns=15, debug_dump=False)
     assert evaluator is not None
     assert evaluator.metric_value == 350.0
 
     with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n")
+        mock_run.return_value = type("R", (), {"returncode": 0, "stdout": "abc1234\n"})()
         commit = _git_commit_or_revert(state, worker, proj)
 
     decision = _decide(state, evaluator)
